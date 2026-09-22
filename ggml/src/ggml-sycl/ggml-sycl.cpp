@@ -5714,6 +5714,14 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             continue;
         }
 
+        if (node->op == GGML_OP_MUL) {
+            const int signed_fwht_skip = ggml_sycl_try_signed_fwht(*sycl_ctx, cgraph, i);
+            if (signed_fwht_skip) {
+                i += signed_fwht_skip;
+                continue;
+            }
+        }
+
         const int nodes_to_skip = ggml_sycl_fuse(*sycl_ctx, cgraph, i);
         if (nodes_to_skip != 0) {
             i += nodes_to_skip;
