@@ -58,7 +58,7 @@ int main(int argc, char ** argv) {
     auto * out = std::fopen(argv[4], "wb");
     if (!out) return 7;
     const int32_t nv = llama_vocab_n_tokens(vocab), steps = 1 + decode_count / interval;
-    // The comparison script reads two int32 dimensions followed by full FP32 vocabulary rows.
+    // The output contains two int32 dimensions followed by full FP32 vocabulary rows.
     if (std::fwrite(&nv, sizeof(nv), 1, out) != 1 || std::fwrite(&steps, sizeof(steps), 1, out) != 1) return 9;
     auto dump = [&]() {
         const float * logits = llama_get_logits(ctx);

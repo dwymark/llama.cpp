@@ -116,7 +116,7 @@ static void concat_T_sycl(const T *x, const T *y, T *dst,
   if constexpr (std::is_same_v<T, float>) {
       static const int flat = ggml_sycl_get_env("GGML_SYCL_CONCAT_FLAT", 0);
       if (flat && dim == 0 && ne0 <= 32) {
-          // Narrow rows share a workgroup so every scheduled lane copies an element.
+          // A workgroup spans consecutive rows of the narrow output.
           if (ne0 == 4) {
               concat_flat_f32<4>(x, y, dst, ne0, ne00, int64_t(ne1) * ne2, stream);
           } else {
