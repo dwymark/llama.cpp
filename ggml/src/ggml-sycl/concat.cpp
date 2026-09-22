@@ -90,41 +90,10 @@ static void concat_T_dim2(const T *x, const T *y, T *dst,
   }
 }
 
-template <int fixed_width>
-static void concat_flat_f32(const float * x, const float * y, float * dst,
-                            int width, int first_width, int64_t rows, queue_ptr stream) {
-    const int64_t count = rows * width;
-    const sycl::range<1> local(SYCL_CONCAT_BLOCK_SIZE);
-    const sycl::range<1> global(((count + local[0] - 1) / local[0]) * local[0]);
-    stream->parallel_for(sycl::nd_range<1>(global, local), [=](sycl::nd_item<1> item) {
-        const int64_t index = item.get_global_id(0);
-        if (index >= count) {
-            return;
-        }
-        const int row_width = fixed_width ? fixed_width : width;
-        const int64_t row = index / row_width;
-        const int col = index % row_width;
-        dst[index] = col < first_width ? x[row * first_width + col] :
-            y[row * (row_width - first_width) + col - first_width];
-    });
-}
-
 template <typename T>
 static void concat_T_sycl(const T *x, const T *y, T *dst,
                             int ne00, int ne01, int ne02, int ne0, int ne1,
                             int ne2, int dim, queue_ptr stream) {
-  if constexpr (std::is_same_v<T, float>) {
-      static const int flat = ggml_sycl_get_env("GGML_SYCL_CONCAT_FLAT", 0);
-      if (flat && dim == 0 && ne0 <= 32) {
-          // A workgroup spans consecutive rows of the narrow output.
-          if (ne0 == 4) {
-              concat_flat_f32<4>(x, y, dst, ne0, ne00, int64_t(ne1) * ne2, stream);
-          } else {
-              concat_flat_f32<0>(x, y, dst, ne0, ne00, int64_t(ne1) * ne2, stream);
-          }
-          return;
-      }
-  }
   int num_blocks = (ne0 + SYCL_CONCAT_BLOCK_SIZE - 1) / SYCL_CONCAT_BLOCK_SIZE;
   sycl::range<3> gridDim(ne2, ne1, num_blocks);
   switch (dim) {
