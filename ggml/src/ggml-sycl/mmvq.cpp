@@ -6,6 +6,10 @@
 #include "quants.hpp"
 #include "vecdotq.hpp"
 
+#if defined(__INTEL_LLVM_COMPILER)
+#include <sycl/ext/intel/esimd.hpp>
+#endif
+
 template <typename reorder_vec_dot_q_sycl>
 static void mul_mat_vec_q_reorder(const void * __restrict__ vx, const void * __restrict__ vy, float * __restrict__ dst,
                                   const int ncols, const int nrows, const sycl::nd_item<3> & nd_item) {
@@ -1344,11 +1348,76 @@ static int pq2_rows_per_group() {
     return rows;
 }
 
+#if defined(__INTEL_LLVM_COMPILER)
+static void mul_mat_vec_pq2_0_q8_1_esimd(const void * vx, const void * vy, float * dst,
+                                         const int ncols, const int nrows, dpct::queue_ptr stream) {
+    const int rows = pq2_rows_per_group();
+    const sycl::range<1> local(rows);
+    const sycl::range<1> global(((nrows + rows - 1) / rows) * rows);
+    stream->parallel_for(sycl::nd_range<1>(global, local),
+        [=](sycl::nd_item<1> item) [[intel::sycl_explicit_simd]] {
+            using namespace sycl::ext::intel::esimd;
+            constexpr int lanes = 16;
+            const int row = item.get_global_id(0);
+            if (row >= nrows) {
+                return;
+            }
+            const uint8_t * weights = static_cast<const uint8_t *>(vx) +
+                static_cast<size_t>(row) * (ncols / QK_PQ2_0) * sizeof(block_pq2_0);
+            const uint8_t * input = static_cast<const uint8_t *>(vy);
+            simd<float, lanes> acc = 0.0f;
+            const simd<uint32_t, lanes> lane(0, 1);
+            const simd<sycl::half, lanes> zero_half = sycl::half(0.0f);
+            // Each vector lane owns one 32-value activation block.
+            for (int i = 0; i < ncols / QK8_1; i += lanes) {
+                const simd<uint32_t, lanes> q = lane + i;
+                const simd_mask<lanes> valid = q < static_cast<uint32_t>(ncols / QK8_1);
+                const simd<uint32_t, lanes> wb = (q / 4) * sizeof(block_pq2_0);
+                const simd<uint32_t, lanes> wo = wb + 2 + (q % 4) * 8;
+                const simd<uint32_t, lanes> ab = q * sizeof(block_q8_1);
+                const simd<sycl::half, lanes> wd = gather<sycl::half, lanes, 1>(
+                    reinterpret_cast<const sycl::half *>(weights), wb, valid, zero_half);
+                const simd<sycl::half, lanes> ad = gather<sycl::half, lanes, 1>(
+                    reinterpret_cast<const sycl::half *>(input), ab, valid, zero_half);
+                simd<int, lanes> sum = 0;
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    const simd<uint32_t, lanes> offsets = wo + 2 * j;
+                    const simd<uint16_t, lanes> pair16 = gather<uint16_t, lanes, 1>(
+                        reinterpret_cast<const uint16_t *>(weights), offsets, valid, simd<uint16_t, lanes>(0));
+                    const simd<uint32_t, lanes> pair = pair16;
+#pragma unroll
+                    for (int k = 0; k < 2; ++k) {
+                        simd<uint32_t, lanes> values = (pair >> (8 * k)) & 0xff;
+                        values = (values | (values << 12)) & 0x000f000f;
+                        values = (values | (values << 6)) & 0x03030303;
+                        values = ((values | 0x80808080u) - 0x01010101u) ^ 0x80808080u;
+                        const simd<int, lanes> w = values.bit_cast_view<int>();
+                        const simd<uint32_t, lanes> offsets_a = ab + 4 + 4 * (2 * j + k);
+                        const simd<int, lanes> a = gather<int, lanes, 1>(
+                            reinterpret_cast<const int *>(input), offsets_a, valid, simd<int, lanes>(0));
+                        sum = dp4a<int>(w, a, sum);
+                    }
+                }
+                acc += simd<float, lanes>(wd) * simd<float, lanes>(ad) * simd<float, lanes>(sum);
+            }
+            dst[row] = reduce<float>(acc, std::plus<>{});
+        });
+}
+#endif
+
 static void mul_mat_vec_pq2_0_q8_1_sycl(const void * vx, const void * vy,
                                         float * dst, const int ncols,
                                         const int nrows,
                                         dpct::queue_ptr stream) {
     GGML_ASSERT(ncols % QK_PQ2_0 == 0);
+#if defined(__INTEL_LLVM_COMPILER)
+    static const int use_esimd = ggml_sycl_get_env("GGML_SYCL_PQ2_ESIMD", 0);
+    if (use_esimd && g_ggml_sycl_enable_esimd) {
+        mul_mat_vec_pq2_0_q8_1_esimd(vx, vy, dst, ncols, nrows, stream);
+        return;
+    }
+#endif
     const int rows = pq2_rows_per_group();
     const int block_num_y = (nrows + rows - 1) / rows;
     const sycl::range<3> block_nums(1, 1, block_num_y);
