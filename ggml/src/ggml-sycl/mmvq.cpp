@@ -1349,6 +1349,7 @@ static int pq2_rows_per_group() {
 }
 
 #if defined(__INTEL_LLVM_COMPILER)
+template <int lanes>
 static void mul_mat_vec_pq2_0_q8_1_esimd(const void * vx, const void * vy, float * dst,
                                          const int ncols, const int nrows, dpct::queue_ptr stream) {
     const int rows = pq2_rows_per_group();
@@ -1357,7 +1358,6 @@ static void mul_mat_vec_pq2_0_q8_1_esimd(const void * vx, const void * vy, float
     stream->parallel_for(sycl::nd_range<1>(global, local),
         [=](sycl::nd_item<1> item) [[intel::sycl_explicit_simd]] {
             using namespace sycl::ext::intel::esimd;
-            constexpr int lanes = 16;
             const int row = item.get_global_id(0);
             if (row >= nrows) {
                 return;
@@ -1414,7 +1414,14 @@ static void mul_mat_vec_pq2_0_q8_1_sycl(const void * vx, const void * vy,
 #if defined(__INTEL_LLVM_COMPILER)
     static const int use_esimd = ggml_sycl_get_env("GGML_SYCL_PQ2_ESIMD", 0);
     if (use_esimd && g_ggml_sycl_enable_esimd) {
-        mul_mat_vec_pq2_0_q8_1_esimd(vx, vy, dst, ncols, nrows, stream);
+        static const int lanes = ggml_sycl_get_env("GGML_SYCL_PQ2_LANES", 16);
+        switch (lanes) {
+            case 8:  mul_mat_vec_pq2_0_q8_1_esimd<8> (vx, vy, dst, ncols, nrows, stream); break;
+            case 16: mul_mat_vec_pq2_0_q8_1_esimd<16>(vx, vy, dst, ncols, nrows, stream); break;
+            case 32: mul_mat_vec_pq2_0_q8_1_esimd<32>(vx, vy, dst, ncols, nrows, stream); break;
+            case 64: mul_mat_vec_pq2_0_q8_1_esimd<64>(vx, vy, dst, ncols, nrows, stream); break;
+            default: GGML_ABORT("unsupported PQ2_0 vector width: %d", lanes);
+        }
         return;
     }
 #endif
