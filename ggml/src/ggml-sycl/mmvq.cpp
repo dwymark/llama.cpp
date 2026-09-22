@@ -1349,8 +1349,8 @@ static int pq2_rows_per_group() {
 }
 
 #if defined(__INTEL_LLVM_COMPILER)
-template <int lanes>
-static void mul_mat_vec_pq2_0_q8_1_esimd(const void * vx, const void * vy, float * dst,
+template <int lanes, bool bulk_input>
+static void mul_mat_vec_pq2_0_q8_1_esimd_impl(const void * vx, const void * vy, float * dst,
                                          const int ncols, const int nrows, dpct::queue_ptr stream) {
     const int rows = pq2_rows_per_group();
     const sycl::range<1> local(rows);
@@ -1379,6 +1379,12 @@ static void mul_mat_vec_pq2_0_q8_1_esimd(const void * vx, const void * vy, float
                     reinterpret_cast<const sycl::half *>(weights), wb, valid, zero_half);
                 const simd<sycl::half, lanes> ad = gather<sycl::half, lanes, 1>(
                     reinterpret_cast<const sycl::half *>(input), ab, valid, zero_half);
+                simd<int, lanes * 8> input_words;
+                if constexpr (bulk_input) {
+                    const simd<uint32_t, lanes> input_offsets = ab + 4;
+                    input_words = gather<int, lanes * 8, 8>(reinterpret_cast<const int *>(input),
+                        input_offsets, valid, simd<int, lanes * 8>(0));
+                }
                 simd<int, lanes> sum = 0;
 #pragma unroll
                 for (int j = 0; j < 4; ++j) {
@@ -1394,8 +1400,14 @@ static void mul_mat_vec_pq2_0_q8_1_esimd(const void * vx, const void * vy, float
                         values = ((values | 0x80808080u) - 0x01010101u) ^ 0x80808080u;
                         const simd<int, lanes> w = values.template bit_cast_view<int>();
                         const simd<uint32_t, lanes> offsets_a = ab + 4 + 4 * (2 * j + k);
-                        const simd<int, lanes> a = gather<int, lanes, 1>(
-                            reinterpret_cast<const int *>(input), offsets_a, valid, simd<int, lanes>(0));
+                        const simd<int, lanes> a = [&]() -> simd<int, lanes> {
+                            if constexpr (bulk_input) {
+                                return input_words.template select<lanes, 1>((2 * j + k) * lanes);
+                            } else {
+                                return gather<int, lanes, 1>(reinterpret_cast<const int *>(input),
+                                    offsets_a, valid, simd<int, lanes>(0));
+                            }
+                        }();
                         sum = dp4a<int>(sum, w, a);
                     }
                 }
@@ -1403,6 +1415,16 @@ static void mul_mat_vec_pq2_0_q8_1_esimd(const void * vx, const void * vy, float
             }
             dst[row] = reduce<float>(acc, std::plus<>{});
         });
+}
+template <int lanes>
+static void mul_mat_vec_pq2_0_q8_1_esimd(const void * vx, const void * vy, float * dst,
+                                       const int ncols, const int nrows, dpct::queue_ptr stream) {
+    static const int bulk_input = ggml_sycl_get_env("GGML_SYCL_PQ2_BULK_INPUT", 0);
+    if (bulk_input) {
+        mul_mat_vec_pq2_0_q8_1_esimd_impl<lanes, true>(vx, vy, dst, ncols, nrows, stream);
+    } else {
+        mul_mat_vec_pq2_0_q8_1_esimd_impl<lanes, false>(vx, vy, dst, ncols, nrows, stream);
+    }
 }
 #endif
 
