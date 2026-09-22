@@ -1282,11 +1282,108 @@ static void mul_mat_vec_q1_0_q8_1_sycl_switch_ncols(
     }
 }
 
+#if defined(__INTEL_LLVM_COMPILER)
+static void mul_mat_vec_ptq1_0_q8_1_esimd(const void * vx, const void * vy, float * dst,
+                                        const int ncols, const int nrows, dpct::queue_ptr stream) {
+    static const int rows = ggml_sycl_get_env("GGML_SYCL_PTQ1_ROWS", 4);
+    GGML_ASSERT(rows > 0 && rows <= 16 && (rows & (rows - 1)) == 0);
+    const sycl::range<1> local(rows);
+    const sycl::range<1> global(((nrows + rows - 1) / rows) * rows);
+    stream->parallel_for(sycl::nd_range<1>(global, local),
+        [=](sycl::nd_item<1> item) [[intel::sycl_explicit_simd]] {
+            using namespace sycl::ext::intel::esimd;
+            constexpr int lanes = 16;
+            const int row = item.get_global_id(0);
+            if (row >= nrows) return;
+            const uint8_t * weights = static_cast<const uint8_t *>(vx) +
+                static_cast<size_t>(row) * (ncols / QK_PTQ1_0) * sizeof(block_ptq1_0);
+            const uint8_t * input = static_cast<const uint8_t *>(vy);
+            const simd<uint32_t, lanes> lane(0, 1);
+            simd<float, lanes> acc = 0.0f;
+            for (int i = 0; i < ncols / QK_PTQ1_0; i += lanes) {
+                const simd<uint32_t, lanes> block = lane + i;
+                const simd_mask<lanes> valid = block < static_cast<uint32_t>(ncols / QK_PTQ1_0);
+                const simd<uint32_t, lanes> wb = block * sizeof(block_ptq1_0);
+                const simd<sycl::half, lanes> wd = gather<sycl::half, lanes, 1>(
+                    reinterpret_cast<const sycl::half *>(weights), wb, valid, simd<sycl::half, lanes>(sycl::half(0)));
+                simd<int, lanes * 8> input_words[4];
+                simd<float, lanes> input_scales[4];
+                simd<int, lanes> sums[4];
+#pragma unroll
+                for (int chunk = 0; chunk < 4; ++chunk) {
+                    const simd<uint32_t, lanes> ab = (block * 4 + chunk) * sizeof(block_q8_1);
+                    const simd<uint32_t, lanes> aq = ab + 4;
+                    input_words[chunk] = gather<int, lanes * 8, 8>(reinterpret_cast<const int *>(input),
+                        aq, valid, simd<int, lanes * 8>(0));
+                    input_scales[chunk] = gather<sycl::half, lanes, 1>(
+                        reinterpret_cast<const sycl::half *>(input), ab, valid, simd<sycl::half, lanes>(sycl::half(0)));
+                    sums[chunk] = 0;
+                }
+#pragma unroll
+                for (int group = 0; group < 6; ++group) {
+                    const simd<uint32_t, lanes> lo_offset = wb + 2 + group * 4;
+                    const simd<uint32_t, lanes> hi_offset = lo_offset + 2;
+                    const simd<uint32_t, lanes> lo = gather<uint16_t, lanes, 1>(
+                        reinterpret_cast<const uint16_t *>(weights), lo_offset, valid, simd<uint16_t, lanes>(0));
+                    const simd<uint32_t, lanes> hi = gather<uint16_t, lanes, 1>(
+                        reinterpret_cast<const uint16_t *>(weights), hi_offset, valid, simd<uint16_t, lanes>(0));
+                    const simd<uint32_t, lanes> packed = lo | (hi << 16);
+                    simd<uint32_t, lanes> v_lo = (packed & 0xff) | ((packed & 0xff00) << 8);
+                    simd<uint32_t, lanes> v_hi = ((packed >> 16) & 0xff) | ((packed & 0xff000000) >> 8);
+#pragma unroll
+                    for (int trit = 0; trit < 5; ++trit) {
+                        const simd<uint32_t, lanes> w_lo = v_lo * 3;
+                        const simd<uint32_t, lanes> w_hi = v_hi * 3;
+                        v_lo = w_lo & 0x00ff00ff; v_hi = w_hi & 0x00ff00ff;
+                        simd<uint32_t, lanes> values = ((w_lo >> 8) & 0xff) | ((w_lo >> 16) & 0xff00) |
+                            ((w_hi << 8) & 0xff0000) | (w_hi & 0xff000000);
+                        values = ((values | 0x80808080u) - 0x01010101u) ^ 0x80808080u;
+                        const simd<int, lanes> w = values.bit_cast_view<int>();
+                        const int element = group < 4 ? trit * 16 + 4 * group : 80 + trit * 8 + 4 * (group - 4);
+                        const int chunk = element / 32;
+                        const simd<int, lanes> a = input_words[chunk].select<lanes, 1>((element % 32) / 4 * lanes);
+                        sums[chunk] = dp4a<int>(sums[chunk], w, a);
+                    }
+                }
+                const simd<uint32_t, lanes> tail_offset = wb + 26;
+                const simd<uint32_t, lanes> tail = gather<uint16_t, lanes, 1>(
+                    reinterpret_cast<const uint16_t *>(weights), tail_offset, valid, simd<uint16_t, lanes>(0));
+                simd<uint32_t, lanes> v = (tail & 0xff) | ((tail & 0xff00) << 8);
+#pragma unroll
+                for (int trit = 0; trit < 4; trit += 2) {
+                    const simd<uint32_t, lanes> w0 = v * 3; v = w0 & 0x00ff00ff;
+                    const simd<uint32_t, lanes> w1 = v * 3; v = w1 & 0x00ff00ff;
+                    simd<uint32_t, lanes> values = ((w0 >> 8) & 0xff) | ((w0 >> 16) & 0xff00) |
+                        ((w1 << 8) & 0xff0000) | (w1 & 0xff000000);
+                    values = ((values | 0x80808080u) - 0x01010101u) ^ 0x80808080u;
+                    const simd<int, lanes> w = values.bit_cast_view<int>();
+                    const simd<int, lanes> a = input_words[3].select<lanes, 1>((6 + trit / 2) * lanes);
+                    sums[3] = dp4a<int>(sums[3], w, a);
+                }
+                simd<float, lanes> weighted_sum = 0.0f;
+#pragma unroll
+                for (int chunk = 0; chunk < 4; ++chunk) {
+                    weighted_sum += input_scales[chunk] * simd<float, lanes>(sums[chunk]);
+                }
+                acc += simd<float, lanes>(wd) * weighted_sum;
+            }
+            dst[row] = reduce<float>(acc, std::plus<>{});
+        });
+}
+#endif
+
 static void mul_mat_vec_ptq1_0_q8_1_sycl(const void * vx, const void * vy,
                                          float * dst, const int ncols,
                                          const int nrows,
                                          dpct::queue_ptr stream) {
     GGML_ASSERT(ncols % QK_PTQ1_0 == 0);
+#if defined(__INTEL_LLVM_COMPILER)
+    static const int use_esimd = ggml_sycl_get_env("GGML_SYCL_PTQ1_ESIMD", 0);
+    if (use_esimd && g_ggml_sycl_enable_esimd) {
+        mul_mat_vec_ptq1_0_q8_1_esimd(vx, vy, dst, ncols, nrows, stream);
+        return;
+    }
+#endif
     const int block_num_y = (nrows + GGML_SYCL_MMV_Y - 1) / GGML_SYCL_MMV_Y;
     const sycl::range<3> block_nums(1, 1, block_num_y);
     const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, WARP_SIZE);
