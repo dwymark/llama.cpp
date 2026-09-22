@@ -11,7 +11,7 @@
 
 template <int tiles>
 static void pq2_prefill(sycl::queue & queue, const block_pq2_0 * weights, const sycl::half * input,
-                  float * output, int k, int m, int n, int ldc) {
+                  float * output, const float * inverse_scale, int k, int m, int n, int ldc) {
     constexpr int token_rows = 8 * tiles;
     const int row_tiles = (m + 15) / 16;
     const int token_tiles = (n + token_rows - 1) / token_rows;
@@ -78,7 +78,7 @@ static void pq2_prefill(sycl::queue & queue, const block_pq2_0 * weights, const 
                     const int t = token_base + tile * 8 + token;
                     if (t < n) {
                         const simd<uint32_t, 16> offsets = (rows + t * ldc) * sizeof(float);
-                        const simd<float, 16> values = accumulators[tile].template select<16, 1>(token * 16);
+                        const simd<float, 16> values = accumulators[tile].template select<16, 1>(token * 16) * inverse_scale[t];
                         scatter<float, 16>(output, offsets, values, valid);
                     }
                 }
@@ -105,15 +105,39 @@ bool ggml_sycl_try_pq2_prefill(ggml_backend_sycl_context & ctx, const void * wei
     }
     ggml_sycl_pool_alloc<sycl::half> converted(ctx.pool(), k * n + 31);
     auto * half_input = reinterpret_cast<sycl::half *>((reinterpret_cast<uintptr_t>(converted.get()) + 63) & ~uintptr_t(63));
-    ggml_get_to_fp16_sycl(GGML_TYPE_F32, nullptr)(input, half_input, k * n, stream);
+    ggml_sycl_pool_alloc<float> scale_storage(ctx.pool(), n);
+    float * inverse_scale = scale_storage.get();
+    const sycl::range<1> local(256), global(n * 256);
+    stream->parallel_for(sycl::nd_range<1>(global, local), [=](sycl::nd_item<1> item) {
+        const int64_t token = item.get_group(0);
+        const int lane = item.get_local_id(0);
+        float maximum = 0.0f;
+        for (int64_t col = lane; col < k; col += 256) {
+            const sycl::half rounded = input[token * k + col];
+            maximum = sycl::fmax(maximum, sycl::fabs(float(rounded)));
+        }
+        maximum = sycl::reduce_over_group(item.get_group(), maximum, sycl::maximum<float>());
+        float boost = 1.0f;
+        while (boost < 1024.0f && maximum * (boost * 2.0f) <= 65504.0f) {
+            boost *= 2.0f;
+        }
+        if (lane == 0) {
+            inverse_scale[token] = 1.0f / boost;
+        }
+        // Rounding before scaling preserves the original FP16 operand precision.
+        for (int64_t col = lane; col < k; col += 256) {
+            const sycl::half rounded = input[token * k + col];
+            half_input[token * k + col] = sycl::half(float(rounded) * boost);
+        }
+    });
     GGML_SYCL_DEBUG("PQ2 fused prefill: k=%lld m=%lld n=%lld\n", (long long) k, (long long) m, (long long) n);
     const auto * packed = static_cast<const block_pq2_0 *>(weights);
     if (n <= 16) {
-        pq2_prefill<2>(*stream, packed, half_input, output, k, m, n, ldc);
+        pq2_prefill<2>(*stream, packed, half_input, output, inverse_scale, k, m, n, ldc);
     } else if (n <= 32) {
-        pq2_prefill<4>(*stream, packed, half_input, output, k, m, n, ldc);
+        pq2_prefill<4>(*stream, packed, half_input, output, inverse_scale, k, m, n, ldc);
     } else {
-        pq2_prefill<8>(*stream, packed, half_input, output, k, m, n, ldc);
+        pq2_prefill<8>(*stream, packed, half_input, output, inverse_scale, k, m, n, ldc);
     }
     static const int check_limit = ggml_sycl_get_env("GGML_SYCL_PQ2_PREFILL_CHECK", 0);
     static int checked = 0;
@@ -127,13 +151,14 @@ bool ggml_sycl_try_pq2_prefill(ggml_backend_sycl_context & ctx, const void * wei
                    m, n, k, &alpha, reference_weights.get(), dpct::library_data_t::real_half, k,
                    half_input, dpct::library_data_t::real_half, k, &beta, reference_output.get(),
                    dpct::library_data_t::real_float, m, dpct::library_data_t::real_float);
-        std::vector<float> actual(size_t(ldc) * n), reference(m * n);
+        std::vector<float> actual(size_t(ldc) * n), reference(m * n), scales(n);
+        stream->memcpy(scales.data(), inverse_scale, scales.size() * sizeof(float));
         stream->memcpy(actual.data(), output, actual.size() * sizeof(float));
         stream->memcpy(reference.data(), reference_output.get(), reference.size() * sizeof(float)).wait_and_throw();
         double error = 0, energy = 0, maximum = 0;
         for (int64_t token = 0; token < n; ++token) {
             for (int64_t row = 0; row < m; ++row) {
-                const double expected = reference[token * m + row];
+                const double expected = double(reference[token * m + row]) * scales[token];
                 const double delta = actual[token * ldc + row] - expected;
                 error += delta * delta;
                 energy += expected * expected;
