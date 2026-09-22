@@ -51,7 +51,6 @@
 
 #include "ggml.h"
 #include "ggml-sycl.h"
-#include "bonsai-mmq.hpp"
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
 
@@ -2732,12 +2731,6 @@ inline void ggml_sycl_op_mul_mat_sycl(
     GGML_ASSERT(bonsai_tile_rows >= 0 && bonsai_tile_rows <= 65536);
     if (bonsai && !bonsai_fp16) {
         use_fp16 = false;
-    }
-    if (src0->type == GGML_TYPE_PQ2_0 && use_fp16 && dst->op_params[0] == GGML_PREC_DEFAULT &&
-        !g_ggml_sycl_enable_dnn && src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src0) &&
-        row_diff == src0->ne[1] && ggml_sycl_try_pq2_prefill(ctx, src0_dd_i, src1_ddf_i, dst_dd_i,
-                                                         ne00, row_diff, src1_ncols, ldc, stream)) {
-        return;
     }
     if (bonsai && bonsai_tile_rows && !g_ggml_sycl_enable_dnn && src1->type == GGML_TYPE_F32 &&
         ggml_is_contiguous(src0) && row_diff == src0->ne[1]) {
