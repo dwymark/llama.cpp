@@ -1392,7 +1392,7 @@ static void mul_mat_vec_pq2_0_q8_1_esimd(const void * vx, const void * vy, float
                         values = (values | (values << 12)) & 0x000f000f;
                         values = (values | (values << 6)) & 0x03030303;
                         values = ((values | 0x80808080u) - 0x01010101u) ^ 0x80808080u;
-                        const simd<int, lanes> w = values.bit_cast_view<int>();
+                        const simd<int, lanes> w = values.template bit_cast_view<int>();
                         const simd<uint32_t, lanes> offsets_a = ab + 4 + 4 * (2 * j + k);
                         const simd<int, lanes> a = gather<int, lanes, 1>(
                             reinterpret_cast<const int *>(input), offsets_a, valid, simd<int, lanes>(0));
