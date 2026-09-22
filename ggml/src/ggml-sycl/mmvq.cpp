@@ -1304,8 +1304,9 @@ static void mul_mat_vec_ptq1_0_q8_1_esimd(const void * vx, const void * vy, floa
                 const simd<uint32_t, lanes> block = lane + i;
                 const simd_mask<lanes> valid = block < static_cast<uint32_t>(ncols / QK_PTQ1_0);
                 const simd<uint32_t, lanes> wb = block * sizeof(block_ptq1_0);
+                const simd<uint32_t, lanes> scale_offsets = wb + offsetof(block_ptq1_0, d);
                 const simd<sycl::half, lanes> wd = gather<sycl::half, lanes, 1>(
-                    reinterpret_cast<const sycl::half *>(weights), wb, valid, simd<sycl::half, lanes>(sycl::half(0)));
+                    reinterpret_cast<const sycl::half *>(weights), scale_offsets, valid, simd<sycl::half, lanes>(sycl::half(0)));
                 simd<int, lanes * 8> input_words[4];
                 simd<float, lanes> input_scales[4];
                 simd<int, lanes> sums[4];
@@ -1319,15 +1320,19 @@ static void mul_mat_vec_ptq1_0_q8_1_esimd(const void * vx, const void * vy, floa
                         reinterpret_cast<const sycl::half *>(input), ab, valid, simd<sycl::half, lanes>(sycl::half(0)));
                     sums[chunk] = 0;
                 }
+                simd<uint32_t, lanes * 4> first_words = gather<uint32_t, lanes * 4, 4>(
+                    reinterpret_cast<const uint32_t *>(weights), wb, valid, simd<uint32_t, lanes * 4>(0));
+                const simd<uint32_t, lanes> last_offsets = wb + 16;
+                simd<uint32_t, lanes * 2> last_words = gather<uint32_t, lanes * 2, 2>(
+                    reinterpret_cast<const uint32_t *>(weights), last_offsets, valid, simd<uint32_t, lanes * 2>(0));
 #pragma unroll
                 for (int group = 0; group < 6; ++group) {
-                    const simd<uint32_t, lanes> lo_offset = wb + 2 + group * 4;
-                    const simd<uint32_t, lanes> hi_offset = lo_offset + 2;
-                    const simd<uint32_t, lanes> lo = gather<uint16_t, lanes, 1>(
-                        reinterpret_cast<const uint16_t *>(weights), lo_offset, valid, simd<uint16_t, lanes>(0));
-                    const simd<uint32_t, lanes> hi = gather<uint16_t, lanes, 1>(
-                        reinterpret_cast<const uint16_t *>(weights), hi_offset, valid, simd<uint16_t, lanes>(0));
-                    const simd<uint32_t, lanes> packed = lo | (hi << 16);
+                    simd<uint32_t, lanes> packed;
+                    if (group < 4) {
+                        packed = first_words.select<lanes, 1>(group * lanes);
+                    } else {
+                        packed = last_words.select<lanes, 1>((group - 4) * lanes);
+                    }
                     simd<uint32_t, lanes> v_lo = (packed & 0xff) | ((packed & 0xff00) << 8);
                     simd<uint32_t, lanes> v_hi = ((packed >> 16) & 0xff) | ((packed & 0xff000000) >> 8);
 #pragma unroll
@@ -1345,7 +1350,7 @@ static void mul_mat_vec_ptq1_0_q8_1_esimd(const void * vx, const void * vy, floa
                         sums[chunk] = dp4a<int>(sums[chunk], w, a);
                     }
                 }
-                const simd<uint32_t, lanes> tail_offset = wb + 26;
+                const simd<uint32_t, lanes> tail_offset = wb + offsetof(block_ptq1_0, qh);
                 const simd<uint32_t, lanes> tail = gather<uint16_t, lanes, 1>(
                     reinterpret_cast<const uint16_t *>(weights), tail_offset, valid, simd<uint16_t, lanes>(0));
                 simd<uint32_t, lanes> v = (tail & 0xff) | ((tail & 0xff00) << 8);
