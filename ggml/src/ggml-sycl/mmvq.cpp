@@ -1396,7 +1396,7 @@ static void mul_mat_vec_pq2_0_q8_1_esimd(const void * vx, const void * vy, float
                         const simd<uint32_t, lanes> offsets_a = ab + 4 + 4 * (2 * j + k);
                         const simd<int, lanes> a = gather<int, lanes, 1>(
                             reinterpret_cast<const int *>(input), offsets_a, valid, simd<int, lanes>(0));
-                        sum = dp4a<int>(w, a, sum);
+                        sum = dp4a<int>(sum, w, a);
                     }
                 }
                 acc += simd<float, lanes>(wd) * simd<float, lanes>(ad) * simd<float, lanes>(sum);
