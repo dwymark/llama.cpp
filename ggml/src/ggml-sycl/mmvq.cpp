@@ -1400,14 +1400,13 @@ static void mul_mat_vec_pq2_0_q8_1_esimd_impl(const void * vx, const void * vy, 
                         values = ((values | 0x80808080u) - 0x01010101u) ^ 0x80808080u;
                         const simd<int, lanes> w = values.template bit_cast_view<int>();
                         const simd<uint32_t, lanes> offsets_a = ab + 4 + 4 * (2 * j + k);
-                        const simd<int, lanes> a = [&]() -> simd<int, lanes> {
-                            if constexpr (bulk_input) {
-                                return input_words.template select<lanes, 1>((2 * j + k) * lanes);
-                            } else {
-                                return gather<int, lanes, 1>(reinterpret_cast<const int *>(input),
-                                    offsets_a, valid, simd<int, lanes>(0));
-                            }
-                        }();
+                        simd<int, lanes> a;
+                        if constexpr (bulk_input) {
+                            a = input_words.template select<lanes, 1>((2 * j + k) * lanes);
+                        } else {
+                            a = gather<int, lanes, 1>(reinterpret_cast<const int *>(input),
+                                offsets_a, valid, simd<int, lanes>(0));
+                        }
                         sum = dp4a<int>(sum, w, a);
                     }
                 }
