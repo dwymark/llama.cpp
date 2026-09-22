@@ -43,7 +43,7 @@ def compare(reference, candidate):
         am, bm = aa[ai], bb[bi]
         za = math.fsum(math.exp(x - am) for x in aa)
         zb = math.fsum(math.exp(x - bm) for x in bb)
-        offset = math.log(zb) + bm - math.log(za) - am
+        offset = (math.log(zb) - math.log(za)) + (bm - am)
         divergences.append(math.fsum(math.exp(x - am) / za * (x - y + offset) for x, y in zip(aa, bb)))
     return {"positions": rows, "vocabulary": vocabulary,
             "rmse": math.sqrt(error_squared / len(a)),
