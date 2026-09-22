@@ -9816,6 +9816,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_rope(type, {128, 32, 2, 1}, 32, GGML_ROPE_TYPE_NEOX, 512, 1.4245f, 0.7465f, 1.4245f, false, 0, true, true, 32));
     }
 
+    for (int64_t rows : { 13, 10240 }) {
+        for (int v : { 0, 1, 2, 3 }) {
+            test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {3, rows, 2, 2}, 1, 0, v));
+        }
+    }
+    test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {3, 10240, 1, 1}, 1, 0));
+    test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {5, 127, 1, 1}, 2, 0));
+
     for (int v : { 0, 1, 2, 3 }) {
         for (int dim : { 0, 1, 2, 3, }) {
             test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {11, 12, 13, 14}, 7, dim, v));
@@ -10305,6 +10313,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {3, 10240, 1, 1}, 1, 0));
+    test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {5, 127, 1, 1}, 2, 0));
 
     for (int n : {127, 30720, 786432}) {
         test_cases.emplace_back(new test_get_rows(GGML_TYPE_F32, n, 1, 1, 1, 1, false));
