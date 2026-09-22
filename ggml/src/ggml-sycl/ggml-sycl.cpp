@@ -2652,47 +2652,6 @@ catch (sycl::exception const &exc) {
   std::exit(1);
 }
 
-template <typename T>
-static void ggml_sycl_bonsai_gemm_tiled(
-        ggml_backend_sycl_context & ctx, const ggml_tensor * src0, ggml_tensor * dst,
-        const char * weights, const float * input, float * output,
-        int64_t nrows, int64_t ncols, int64_t ninputs, int ldc, int64_t tile_rows,
-        const queue_ptr & stream) {
-    constexpr bool half = std::is_same_v<T, sycl::half>;
-    constexpr auto data_type = half ? dpct::library_data_t::real_half : dpct::library_data_t::real_float;
-    const auto convert_weights = [&]() {
-        if constexpr (half) {
-            return ggml_get_to_fp16_sycl(src0->type, dst);
-        } else {
-            return ggml_get_to_fp32_sycl(src0->type, dst);
-        }
-    }();
-    GGML_ASSERT(convert_weights != nullptr);
-    ggml_sycl_pool_alloc<T> weight_tile(ctx.pool(), std::min(tile_rows, nrows) * ncols);
-    ggml_sycl_pool_alloc<sycl::half> half_input(ctx.pool());
-    const T * input_ptr;
-    if constexpr (half) {
-        half_input.alloc(ninputs * ncols);
-        ggml_get_to_fp16_sycl(GGML_TYPE_F32, dst)(input, half_input.get(), ninputs * ncols, stream);
-        input_ptr = half_input.get();
-    } else {
-        input_ptr = input;
-    }
-    const size_t row_bytes = ggml_row_size(src0->type, ncols);
-    const float alpha = 1.0f;
-    const float beta = 0.0f;
-    // The in-order queue consumes each tile before its storage is reused.
-    for (int64_t row = 0; row < nrows; row += tile_rows) {
-        const int64_t count = std::min(tile_rows, nrows - row);
-        convert_weights(weights + row * row_bytes, weight_tile.get(), count * ncols, stream);
-        SYCL_CHECK(CHECK_TRY_ERROR(dpct::gemm(
-            *stream, oneapi::mkl::transpose::trans, oneapi::mkl::transpose::nontrans,
-            count, ninputs, ncols, &alpha, weight_tile.get(), data_type, ncols,
-            input_ptr, data_type, ncols, &beta, output + row,
-            dpct::library_data_t::real_float, ldc, dpct::library_data_t::real_float)));
-    }
-}
-
 inline void ggml_sycl_op_mul_mat_sycl(
     ggml_backend_sycl_context & ctx,
     const ggml_tensor *src0, const ggml_tensor *src1, ggml_tensor *dst,
@@ -2727,21 +2686,8 @@ inline void ggml_sycl_op_mul_mat_sycl(
 #endif
     const bool bonsai = src0->type == GGML_TYPE_PQ2_0 || src0->type == GGML_TYPE_PTQ1_0;
     static const int bonsai_fp16 = ggml_sycl_get_env("GGML_SYCL_BONSAI_F16", 1);
-    static const int bonsai_tile_rows = ggml_sycl_get_env("GGML_SYCL_BONSAI_TILE_ROWS", 0);
-    GGML_ASSERT(bonsai_tile_rows >= 0 && bonsai_tile_rows <= 65536);
     if (bonsai && !bonsai_fp16) {
         use_fp16 = false;
-    }
-    if (bonsai && bonsai_tile_rows && !g_ggml_sycl_enable_dnn && src1->type == GGML_TYPE_F32 &&
-        ggml_is_contiguous(src0) && row_diff == src0->ne[1]) {
-        if (use_fp16 && dst->op_params[0] == GGML_PREC_DEFAULT) {
-            ggml_sycl_bonsai_gemm_tiled<sycl::half>(ctx, src0, dst, src0_dd_i, src1_ddf_i, dst_dd_i,
-                                                   row_diff, ne00, src1_ncols, ldc, bonsai_tile_rows, stream);
-        } else {
-            ggml_sycl_bonsai_gemm_tiled<float>(ctx, src0, dst, src0_dd_i, src1_ddf_i, dst_dd_i,
-                                              row_diff, ne00, src1_ncols, ldc, bonsai_tile_rows, stream);
-        }
-        return;
     }
 
 #if GGML_SYCL_DNNL && defined(GGML_SYCL_HAS_BF16)
