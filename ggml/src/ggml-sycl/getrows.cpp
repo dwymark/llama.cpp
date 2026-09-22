@@ -219,7 +219,28 @@ static void get_rows_sycl_float(ggml_backend_sycl_context & ctx, const ggml_tens
         if (single_row_copy && ne01 == 1 && ne02 == 1 && ne03 == 1 &&
             ggml_nelements(src1) == 1 && ggml_is_contiguous(src0) && ggml_is_contiguous(dst)) {
             // A valid index into a single-row tensor is zero.
-            stream->memcpy(dst_dd, src0_dd, ne00 * sizeof(src0_t));
+            if (dst_dd == src0_dd) {
+                return;
+            }
+            if (single_row_copy == 2) {
+                const int64_t vectors = (ne00 + 3) / 4;
+                const sycl::range<1> local(SYCL_GET_ROWS_BLOCK_SIZE);
+                const sycl::range<1> global(((vectors + local[0] - 1) / local[0]) * local[0]);
+                stream->parallel_for(sycl::nd_range<1>(global, local), [=](sycl::nd_item<1> item) {
+                    const int64_t i = item.get_global_id(0);
+                    if (4 * i + 3 < ne00) {
+                        sycl::vec<src0_t, 4> values;
+                        values.load(i, src0_dd);
+                        values.store(i, dst_dd);
+                    } else {
+                        for (int64_t j = 4 * i; j < ne00; ++j) {
+                            dst_dd[j] = src0_dd[j];
+                        }
+                    }
+                });
+            } else {
+                stream->memcpy(dst_dd, src0_dd, ne00 * sizeof(src0_t));
+            }
             return;
         }
     }
