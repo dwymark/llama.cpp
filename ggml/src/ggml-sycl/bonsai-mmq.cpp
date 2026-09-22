@@ -1,6 +1,9 @@
 #include "bonsai-mmq.hpp"
 #include "convert.hpp"
 
+#include <cmath>
+#include <vector>
+
 #if defined(__INTEL_LLVM_COMPILER)
 #include <sycl/ext/intel/esimd.hpp>
 #include <sycl/ext/intel/esimd/xmx/dpas.hpp>
@@ -111,6 +114,35 @@ bool ggml_sycl_try_pq2_prefill(ggml_backend_sycl_context & ctx, const void * wei
         pq2_prefill<4>(*stream, packed, half_input, output, k, m, n, ldc);
     } else {
         pq2_prefill<8>(*stream, packed, half_input, output, k, m, n, ldc);
+    }
+    static const int check_limit = ggml_sycl_get_env("GGML_SYCL_PQ2_PREFILL_CHECK", 0);
+    static int checked = 0;
+    if (checked < check_limit) {
+        ++checked;
+        ggml_sycl_pool_alloc<sycl::half> reference_weights(ctx.pool(), k * m);
+        ggml_sycl_pool_alloc<float> reference_output(ctx.pool(), m * n);
+        ggml_get_to_fp16_sycl(GGML_TYPE_PQ2_0, nullptr)(weights, reference_weights.get(), k * m, stream);
+        const float alpha = 1.0f, beta = 0.0f;
+        dpct::gemm(*stream, oneapi::mkl::transpose::trans, oneapi::mkl::transpose::nontrans,
+                   m, n, k, &alpha, reference_weights.get(), dpct::library_data_t::real_half, k,
+                   half_input, dpct::library_data_t::real_half, k, &beta, reference_output.get(),
+                   dpct::library_data_t::real_float, m, dpct::library_data_t::real_float);
+        std::vector<float> actual(size_t(ldc) * n), reference(m * n);
+        stream->memcpy(actual.data(), output, actual.size() * sizeof(float));
+        stream->memcpy(reference.data(), reference_output.get(), reference.size() * sizeof(float)).wait_and_throw();
+        double error = 0, energy = 0, maximum = 0;
+        for (int64_t token = 0; token < n; ++token) {
+            for (int64_t row = 0; row < m; ++row) {
+                const double expected = reference[token * m + row];
+                const double delta = actual[token * ldc + row] - expected;
+                error += delta * delta;
+                energy += expected * expected;
+                maximum = std::max(maximum, std::abs(delta));
+            }
+        }
+        std::fprintf(stderr, "PQ2 live GEMM check=%d k=%lld m=%lld n=%lld nmse=%.9g max_abs=%.9g\n",
+                     checked, (long long) k, (long long) m, (long long) n, error / std::max(energy, 1e-30), maximum);
+        std::fflush(stderr);
     }
     return true;
 #else
