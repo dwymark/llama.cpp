@@ -214,6 +214,16 @@ static void get_rows_sycl_float(ggml_backend_sycl_context & ctx, const ggml_tens
 
     GGML_TENSOR_BINARY_OP_LOCALS
 
+    static const int single_row_copy = ggml_sycl_get_env("GGML_SYCL_SINGLE_ROW_COPY", 0);
+    if constexpr (std::is_same_v<src0_t, dst_t>) {
+        if (single_row_copy && ne01 == 1 && ne02 == 1 && ne03 == 1 &&
+            ggml_nelements(src1) == 1 && ggml_is_contiguous(src0) && ggml_is_contiguous(dst)) {
+            // A valid index into a single-row tensor is zero.
+            stream->memcpy(dst_dd, src0_dd, ne00 * sizeof(src0_t));
+            return;
+        }
+    }
+
     const sycl::range<3> block_dims(1, 1, SYCL_GET_ROWS_BLOCK_SIZE);
     const int block_num_x = (ne00 + SYCL_GET_ROWS_BLOCK_SIZE - 1) / SYCL_GET_ROWS_BLOCK_SIZE;
     const sycl::range<3> block_nums(ne11 * ne12, ne10, block_num_x);
