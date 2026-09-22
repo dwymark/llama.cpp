@@ -20,12 +20,13 @@ static void fwht_kernel(const float * __restrict__ src, float * __restrict__ dst
 
     float     reg[el_w];
     const int lane = sg.get_local_linear_id();
+    const int64_t sign_base = signed_input ? (r % (sign_count / N)) * N : 0;
 
 #pragma unroll
     for (int i = 0; i < el_w; ++i) {
         float value = src[i * WARP_SIZE + lane];
         if constexpr (signed_input) {
-            value *= signs[(r * N + i * WARP_SIZE + lane) % sign_count];
+            value *= signs[sign_base + i * WARP_SIZE + lane];
         }
         reg[i] = value * scale;
     }
@@ -145,6 +146,15 @@ int ggml_sycl_try_signed_fwht(ggml_backend_sycl_context & ctx, ggml_cgraph * gra
         return 0;
     }
     const int n = int(dst->ne[0]);
+    if (signs->ne[0] % n != 0) {
+        return 0;
+    }
+    const uintptr_t input_begin = reinterpret_cast<uintptr_t>(src->data);
+    const uintptr_t output_begin = reinterpret_cast<uintptr_t>(dst->data);
+    const size_t bytes = ggml_nbytes(dst);
+    if (input_begin < output_begin + bytes && output_begin < input_begin + bytes) {
+        return 0;
+    }
     const int64_t rows = ggml_nrows(dst);
     const float scale = 1.0f / std::sqrt(float(n));
     auto stream = ctx.stream();
