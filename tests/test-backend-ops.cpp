@@ -4634,6 +4634,28 @@ struct test_mul_mat : public test_case {
 };
 
 // GGML_HINT_SRC0_IS_HADAMARD
+struct test_mul_mat_small_f16 : public test_mul_mat {
+    explicit test_mul_mat_small_f16(int64_t tokens)
+        : test_mul_mat(GGML_TYPE_PQ2_0, GGML_TYPE_F32, 67, tokens, 256, {1, 1}, {1, 1}) {}
+
+    std::string vars() override { return test_mul_mat::vars() + ",small_f16=1"; }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "b") == 0) {
+                std::vector<float> data(ggml_nelements(t));
+                for (size_t i = 0; i < data.size(); ++i) {
+                    const int value = i % 32 == 0 ? 127 : int((i * 17) % 255) - 127;
+                    data[i] = std::ldexp(float(value), -24);
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(float));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 struct test_mul_mat_hadamard : public test_mul_mat {
     test_mul_mat_hadamard(ggml_type type_a = GGML_TYPE_F32, ggml_type type_b = GGML_TYPE_F32,
             int64_t m = 32, int64_t n = 32, int64_t k = 32,
@@ -9434,6 +9456,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 6, 4096, 5120, {1, 1}, {1, 1}));
+
+    for (int64_t tokens : {9, 17, 65, 256}) {
+        test_cases.emplace_back(new test_mul_mat_small_f16(tokens));
+    }
 
     // K not a multiple of 32
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F16, 64, 32,  65, {1, 1}, {1, 1}));
