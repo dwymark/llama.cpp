@@ -4633,7 +4633,6 @@ struct test_mul_mat : public test_case {
     }
 };
 
-// GGML_HINT_SRC0_IS_HADAMARD
 struct test_mul_mat_small_f16 : public test_mul_mat {
     explicit test_mul_mat_small_f16(int64_t tokens)
         : test_mul_mat(GGML_TYPE_PQ2_0, GGML_TYPE_F32, 67, tokens, 256, {1, 1}, {1, 1}) {}
@@ -4656,6 +4655,7 @@ struct test_mul_mat_small_f16 : public test_mul_mat {
     }
 };
 
+// GGML_HINT_SRC0_IS_HADAMARD
 struct test_mul_mat_hadamard : public test_mul_mat {
     test_mul_mat_hadamard(ggml_type type_a = GGML_TYPE_F32, ggml_type type_b = GGML_TYPE_F32,
             int64_t m = 32, int64_t n = 32, int64_t k = 32,
