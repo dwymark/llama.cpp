@@ -1451,7 +1451,7 @@ static int pq2_rows_per_group() {
 }
 
 #if defined(__INTEL_LLVM_COMPILER)
-template <int lanes, bool bulk_input>
+template <int lanes, bool bulk_input, bool aligned_weights = false>
 static void mul_mat_vec_pq2_0_q8_1_esimd_impl(const void * vx, const void * vy, float * dst,
                                          const int ncols, const int nrows, dpct::queue_ptr stream) {
     const int rows = pq2_rows_per_group();
@@ -1487,13 +1487,35 @@ static void mul_mat_vec_pq2_0_q8_1_esimd_impl(const void * vx, const void * vy, 
                     input_words = gather<int, lanes * 8, 8>(reinterpret_cast<const int *>(input),
                         input_offsets, valid, simd<int, lanes * 8>(0));
                 }
+                simd<uint32_t, lanes * 2> packed_weights;
+                if constexpr (aligned_weights) {
+                    const simd<uint32_t, lanes> alignment = (wo + uint32_t(reinterpret_cast<uintptr_t>(weights) & 3)) & 3;
+                    const simd<uint32_t, lanes> aligned_offsets = wo - alignment;
+                    packed_weights = gather<uint32_t, lanes * 2, 2>(reinterpret_cast<const uint32_t *>(weights),
+                        aligned_offsets, valid, simd<uint32_t, lanes * 2>(0));
+                    const simd_mask<lanes> shifted = valid & (alignment == 2);
+                    const simd<uint32_t, lanes> tail_offsets = wo + 6;
+                    const simd<uint32_t, lanes> tail = gather<uint16_t, lanes, 1>(
+                        reinterpret_cast<const uint16_t *>(weights), tail_offsets, shifted, simd<uint16_t, lanes>(0));
+                    simd<uint32_t, lanes> first = packed_weights.template select<lanes, 1>(0);
+                    simd<uint32_t, lanes> second = packed_weights.template select<lanes, 1>(lanes);
+                    // The final halfword completes an unaligned payload without crossing its block boundary.
+                    first.merge((first >> 16) | (second << 16), shifted);
+                    second.merge((second >> 16) | (tail << 16), shifted);
+                    packed_weights.template select<lanes, 1>(0) = first;
+                    packed_weights.template select<lanes, 1>(lanes) = second;
+                }
                 simd<int, lanes> sum = 0;
 #pragma unroll
                 for (int j = 0; j < 4; ++j) {
-                    const simd<uint32_t, lanes> offsets = wo + 2 * j;
-                    const simd<uint16_t, lanes> pair16 = gather<uint16_t, lanes, 1>(
-                        reinterpret_cast<const uint16_t *>(weights), offsets, valid, simd<uint16_t, lanes>(0));
-                    const simd<uint32_t, lanes> pair = pair16;
+                    simd<uint32_t, lanes> pair;
+                    if constexpr (aligned_weights) {
+                        pair = (packed_weights.template select<lanes, 1>((j / 2) * lanes) >> ((j % 2) * 16)) & 0xffff;
+                    } else {
+                        const simd<uint32_t, lanes> offsets = wo + 2 * j;
+                        pair = gather<uint16_t, lanes, 1>(reinterpret_cast<const uint16_t *>(weights),
+                            offsets, valid, simd<uint16_t, lanes>(0));
+                    }
 #pragma unroll
                     for (int k = 0; k < 2; ++k) {
                         simd<uint32_t, lanes> values = (pair >> (8 * k)) & 0xff;
@@ -1521,7 +1543,10 @@ template <int lanes>
 static void mul_mat_vec_pq2_0_q8_1_esimd(const void * vx, const void * vy, float * dst,
                                        const int ncols, const int nrows, dpct::queue_ptr stream) {
     static const int bulk_input = ggml_sycl_get_env("GGML_SYCL_PQ2_BULK_INPUT", 0);
-    if (bulk_input) {
+    static const int aligned_weights = ggml_sycl_get_env("GGML_SYCL_PQ2_ALIGNED_LOADS", 0);
+    if (bulk_input && aligned_weights) {
+        mul_mat_vec_pq2_0_q8_1_esimd_impl<lanes, true, true>(vx, vy, dst, ncols, nrows, stream);
+    } else if (bulk_input) {
         mul_mat_vec_pq2_0_q8_1_esimd_impl<lanes, true>(vx, vy, dst, ncols, nrows, stream);
     } else {
         mul_mat_vec_pq2_0_q8_1_esimd_impl<lanes, false>(vx, vy, dst, ncols, nrows, stream);
