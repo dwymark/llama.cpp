@@ -113,9 +113,14 @@ bool ggml_sycl_op_fwht(ggml_backend_sycl_context & ctx, const ggml_tensor * src,
         case 512:
             launch_fwht<512>(src_d, dst_d, rows, scale, stream);
             return true;
-        case 1024:
+        case 1024: {
+            static const int enabled = ggml_sycl_get_env("GGML_SYCL_FWHT_1024", 0);
+            if (!enabled) {
+                return false;
+            }
             launch_fwht<1024>(src_d, dst_d, rows, scale, stream);
             return true;
+        }
         default:
             return false;
     }
