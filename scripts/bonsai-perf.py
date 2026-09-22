@@ -45,6 +45,8 @@ def power_state():
 def run(spec_path):
     spec = json.loads(spec_path.read_text(encoding="utf-8"))
     output = Path(spec["output"])
+    if (output / "summary.json").exists():
+        raise FileExistsError(output / "summary.json")
     output.mkdir(parents=True, exist_ok=True)
     deadline = dt.datetime.fromisoformat(spec["deadline_utc"])
     if deadline.utcoffset() is None:
