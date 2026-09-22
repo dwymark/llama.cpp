@@ -64,6 +64,9 @@ def run(spec_path):
         if record_path.exists():
             raise FileExistsError(record_path)
         record = {"name": job["name"], "argv": job["argv"], "started_utc": now().isoformat(), "source_commit": job.get("source_commit")}
+        job_environment = environment.copy()
+        job_environment.update(job.get("env", {}))
+        record["env"] = dict(spec.get("env", {}), **job.get("env", {}))
         record["power_before"] = power_state()
         timeout = min(float(job["timeout_seconds"]), (deadline - now()).total_seconds())
         if timeout <= 0:
@@ -76,7 +79,7 @@ def run(spec_path):
             options = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == "nt" else {"start_new_session": True}
             started = time.monotonic()
             with (output / (job["name"] + ".log")).open("wb") as log:
-                process = subprocess.Popen(job["argv"], cwd=spec["cwd"], env=environment, stdout=log, stderr=subprocess.STDOUT, **options)
+                process = subprocess.Popen(job["argv"], cwd=spec["cwd"], env=job_environment, stdout=log, stderr=subprocess.STDOUT, **options)
                 record["pid"] = process.pid
                 record["status"] = "running"
                 write_json(record_path, record)
