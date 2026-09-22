@@ -1338,6 +1338,28 @@ static void mul_mat_vec_ptq1_0_q8_1_sycl_switch_ncols(
     }
 }
 
+static __dpct_inline__ float vec_dot_pq2_0_q8_1_packed(
+        const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & iqs) {
+    const block_pq2_0 * bq = static_cast<const block_pq2_0 *>(vbq);
+    const block_q8_1 * activation = bq8_1 + iqs;
+    const uint16_t * packed = reinterpret_cast<const uint16_t *>(bq->qs + iqs * 8);
+    int sum = 0;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const uint32_t pair = packed[j];
+#pragma unroll
+        for (int k = 0; k < 2; ++k) {
+            uint32_t values = (pair >> (8 * k)) & 0xff;
+            values = (values | (values << 12)) & 0x000f000f;
+            values = (values | (values << 6)) & 0x03030303;
+            const int weights = byte_sub_4(values, 0x01010101);
+            const int input = get_int_from_int8_aligned(activation->qs, 2 * j + k);
+            sum = dpct::dp4a(weights, input, sum);
+        }
+    }
+    return static_cast<float>(bq->d) * static_cast<float>(activation->ds[0]) * static_cast<float>(sum);
+}
+
 static void mul_mat_vec_pq2_0_q8_1_sycl(const void * vx, const void * vy,
                                         float * dst, const int ncols,
                                         const int nrows,
@@ -1352,7 +1374,7 @@ static void mul_mat_vec_pq2_0_q8_1_sycl(const void * vx, const void * vy,
             sycl::nd_range<3>(block_nums * block_dims, block_dims),
             [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
                 mul_mat_vec_q<QK_PQ2_0, QI_PQ2_0, block_pq2_0,
-                              VDR_PQ2_0_Q8_1_MMVQ, vec_dot_pq2_0_q8_1>(
+                              VDR_PQ2_0_Q8_1_MMVQ, vec_dot_pq2_0_q8_1_packed>(
                     vx, vy, dst, ncols, nrows, item_ct1);
             });
     });
@@ -1374,7 +1396,7 @@ static void mul_mat_vec_pq2_0_q8_1_sycl_ncols(
             sycl::nd_range<3>(block_nums * block_dims, block_dims),
             [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
                 mul_mat_vec_q_ncols<QK_PQ2_0, QI_PQ2_0, block_pq2_0,
-                                    VDR_PQ2_0_Q8_1_MMVQ, vec_dot_pq2_0_q8_1, ncols_dst>(
+                                    VDR_PQ2_0_Q8_1_MMVQ, vec_dot_pq2_0_q8_1_packed, ncols_dst>(
                     vx, vy, dst, ncols, nrows, stride_col_y, stride_col_dst, item_ct1);
             });
     });
