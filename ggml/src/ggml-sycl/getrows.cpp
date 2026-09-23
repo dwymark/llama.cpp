@@ -218,7 +218,7 @@ static void get_rows_sycl_float(ggml_backend_sycl_context & ctx, const ggml_tens
     if constexpr (std::is_same_v<src0_t, float> && std::is_same_v<dst_t, float>) {
         if (single_row_copy && ne01 == 1 && ne02 == 1 && ne03 == 1 &&
             ggml_nelements(src1) == 1 && ggml_is_contiguous(src0) && ggml_is_contiguous(dst)) {
-            // A valid index into a single-row tensor is zero.
+            // The only valid row index is zero, so src1 is never read.
             if (dst_dd == src0_dd) {
                 return;
             }

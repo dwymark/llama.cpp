@@ -247,9 +247,8 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
     const bool can_use_vector_kernel = Q->ne[0] <= 512 && Q->ne[0] % 64 == 0 && K->ne[1] % FATTN_KQ_STRIDE == 0
         && !has_bf16;
 
-    // Single-query decode normally bypasses the vector kernel whenever the grouped-query optimization applies,
-    // because that rule assumes a matrix-engine kernel takes those shapes. This backend has none, so the
-    // vector kernel can serve decode directly on request.
+    // Serve single-query decode with the vector kernel on request. The grouped-query rule below assumes a
+    // matrix-engine kernel exists for those shapes, and this backend has none.
     static const int decode_vec = ggml_sycl_get_env("GGML_SYCL_FA_DECODE_VEC", 0);
     if (decode_vec && Q->ne[1] == 1 && can_use_vector_kernel &&
         !ggml_is_quantized(K->type) && !ggml_is_quantized(V->type)) {

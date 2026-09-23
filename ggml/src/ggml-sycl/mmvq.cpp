@@ -1283,6 +1283,8 @@ static void mul_mat_vec_q1_0_q8_1_sycl_switch_ncols(
 }
 
 #if defined(__INTEL_LLVM_COMPILER)
+// Explicit-SIMD decode kernel: one work-item per weight row, with the vector lanes spread across that
+// row's blocks. Opt-in through GGML_SYCL_PTQ1_ESIMD; GGML_SYCL_PTQ1_ROWS sets the work-group size.
 static void mul_mat_vec_ptq1_0_q8_1_esimd(const void * vx, const void * vy, float * dst,
                                         const int ncols, const int nrows, dpct::queue_ptr stream) {
     static const int rows = ggml_sycl_get_env("GGML_SYCL_PTQ1_ROWS", 4);
@@ -1444,6 +1446,7 @@ static void mul_mat_vec_ptq1_0_q8_1_sycl_switch_ncols(
     }
 }
 
+// Rows per work-group for the PQ2_0 matrix-vector kernels, from GGML_SYCL_PQ2_ROWS.
 static int pq2_rows_per_group() {
     static const int rows = ggml_sycl_get_env("GGML_SYCL_PQ2_ROWS", GGML_SYCL_MMV_Y);
     GGML_ASSERT(rows > 0 && rows <= 16 && (rows & (rows - 1)) == 0);
@@ -1451,6 +1454,10 @@ static int pq2_rows_per_group() {
 }
 
 #if defined(__INTEL_LLVM_COMPILER)
+// Explicit-SIMD decode kernel: one work-item per weight row, with the vector lanes spread across that
+// row's activation blocks. Opt-in through GGML_SYCL_PQ2_ESIMD. GGML_SYCL_PQ2_LANES picks the vector
+// width, GGML_SYCL_PQ2_BULK_INPUT gathers each lane's activations in one load, and
+// GGML_SYCL_PQ2_ALIGNED_LOADS reads weights as aligned 32-bit words.
 template <int lanes, bool bulk_input, bool aligned_weights = false>
 static void mul_mat_vec_pq2_0_q8_1_esimd_impl(const void * vx, const void * vy, float * dst,
                                          const int ncols, const int nrows, dpct::queue_ptr stream) {
@@ -1499,7 +1506,7 @@ static void mul_mat_vec_pq2_0_q8_1_esimd_impl(const void * vx, const void * vy, 
                         reinterpret_cast<const uint16_t *>(weights), tail_offsets, shifted, simd<uint16_t, lanes>(0));
                     simd<uint32_t, lanes> first = packed_weights.template select<lanes, 1>(0);
                     simd<uint32_t, lanes> second = packed_weights.template select<lanes, 1>(lanes);
-                    // The final halfword completes an unaligned payload without crossing its block boundary.
+                    // A payload that starts mid-word is shifted down and completed from the halfword after it.
                     first.merge((first >> 16) | (second << 16), shifted);
                     second.merge((second >> 16) | (tail << 16), shifted);
                     packed_weights.template select<lanes, 1>(0) = first;
