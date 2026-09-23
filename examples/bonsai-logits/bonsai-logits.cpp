@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <exception>
+#include <cstdlib>
 #include <fstream>
 #include <iterator>
 #include <string>
@@ -41,7 +42,13 @@ int main(int argc, char ** argv) {
     llama_log_set(log_message, nullptr);
     ggml_backend_load_all_from_path(argv[2]);
     llama_backend_init();
-    auto mp = llama_model_default_params(); mp.n_gpu_layers = 99;
+    auto mp = llama_model_default_params();
+    // BONSAI_LOGITS_NGL selects the offload depth; zero also withholds every device so the
+    // scheduler cannot route prompt matrix products to an accelerator.
+    const char * ngl_env = std::getenv("BONSAI_LOGITS_NGL");
+    mp.n_gpu_layers = ngl_env ? std::stoi(ngl_env) : 99;
+    static ggml_backend_dev_t no_devices[] = { nullptr };
+    if (mp.n_gpu_layers == 0) { mp.devices = no_devices; }
     auto * model = llama_model_load_from_file(argv[1], mp);
     if (!model) return 4;
     auto cp = llama_context_default_params();
