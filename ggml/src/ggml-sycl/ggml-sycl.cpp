@@ -2682,8 +2682,13 @@ inline void ggml_sycl_op_mul_mat_sycl(
 #ifdef GGML_SYCL_F16
     bool use_fp16 = true;  // TODO(Yu) SYCL capability check
 #else
-    bool use_fp16 = false;
+    bool use_fp16 = src0->type == GGML_TYPE_PQ2_0 || src0->type == GGML_TYPE_PTQ1_0;
 #endif
+    const bool bonsai = src0->type == GGML_TYPE_PQ2_0 || src0->type == GGML_TYPE_PTQ1_0;
+    static const int bonsai_fp16 = ggml_sycl_get_env("GGML_SYCL_BONSAI_F16", 1);
+    if (bonsai && !bonsai_fp16) {
+        use_fp16 = false;
+    }
 
 #if GGML_SYCL_DNNL && defined(GGML_SYCL_HAS_BF16)
     // Fast path for bf16 src0

@@ -6,6 +6,10 @@
 #include "quants.hpp"
 #include "vecdotq.hpp"
 
+#if defined(__INTEL_LLVM_COMPILER)
+#include <sycl/ext/intel/esimd.hpp>
+#endif
+
 template <typename reorder_vec_dot_q_sycl>
 static void mul_mat_vec_q_reorder(const void * __restrict__ vx, const void * __restrict__ vy, float * __restrict__ dst,
                                   const int ncols, const int nrows, const sycl::nd_item<3> & nd_item) {
@@ -1278,11 +1282,113 @@ static void mul_mat_vec_q1_0_q8_1_sycl_switch_ncols(
     }
 }
 
+#if defined(__INTEL_LLVM_COMPILER)
+static void mul_mat_vec_ptq1_0_q8_1_esimd(const void * vx, const void * vy, float * dst,
+                                        const int ncols, const int nrows, dpct::queue_ptr stream) {
+    static const int rows = ggml_sycl_get_env("GGML_SYCL_PTQ1_ROWS", 4);
+    GGML_ASSERT(rows > 0 && rows <= 16 && (rows & (rows - 1)) == 0);
+    const sycl::range<1> local(rows);
+    const sycl::range<1> global(((nrows + rows - 1) / rows) * rows);
+    stream->parallel_for(sycl::nd_range<1>(global, local),
+        [=](sycl::nd_item<1> item) [[intel::sycl_explicit_simd]] {
+            using namespace sycl::ext::intel::esimd;
+            constexpr int lanes = 16;
+            const int row = item.get_global_id(0);
+            if (row >= nrows) return;
+            const uint8_t * weights = static_cast<const uint8_t *>(vx) +
+                static_cast<size_t>(row) * (ncols / QK_PTQ1_0) * sizeof(block_ptq1_0);
+            const uint8_t * input = static_cast<const uint8_t *>(vy);
+            const simd<uint32_t, lanes> lane(0, 1);
+            simd<float, lanes> acc = 0.0f;
+            for (int i = 0; i < ncols / QK_PTQ1_0; i += lanes) {
+                const simd<uint32_t, lanes> block = lane + i;
+                const simd_mask<lanes> valid = block < static_cast<uint32_t>(ncols / QK_PTQ1_0);
+                const simd<uint32_t, lanes> wb = block * sizeof(block_ptq1_0);
+                const simd<uint32_t, lanes> scale_offsets = wb + offsetof(block_ptq1_0, d);
+                const simd<sycl::half, lanes> wd = gather<sycl::half, lanes, 1>(
+                    reinterpret_cast<const sycl::half *>(weights), scale_offsets, valid, simd<sycl::half, lanes>(sycl::half(0)));
+                simd<int, lanes * 8> input_words[4];
+                simd<float, lanes> input_scales[4];
+                simd<int, lanes> sums[4];
+#pragma unroll
+                for (int chunk = 0; chunk < 4; ++chunk) {
+                    const simd<uint32_t, lanes> ab = (block * 4 + chunk) * sizeof(block_q8_1);
+                    const simd<uint32_t, lanes> aq = ab + 4;
+                    input_words[chunk] = gather<int, lanes * 8, 8>(reinterpret_cast<const int *>(input),
+                        aq, valid, simd<int, lanes * 8>(0));
+                    input_scales[chunk] = gather<sycl::half, lanes, 1>(
+                        reinterpret_cast<const sycl::half *>(input), ab, valid, simd<sycl::half, lanes>(sycl::half(0)));
+                    sums[chunk] = 0;
+                }
+                simd<uint32_t, lanes * 4> first_words = gather<uint32_t, lanes * 4, 4>(
+                    reinterpret_cast<const uint32_t *>(weights), wb, valid, simd<uint32_t, lanes * 4>(0));
+                const simd<uint32_t, lanes> last_offsets = wb + 16;
+                simd<uint32_t, lanes * 2> last_words = gather<uint32_t, lanes * 2, 2>(
+                    reinterpret_cast<const uint32_t *>(weights), last_offsets, valid, simd<uint32_t, lanes * 2>(0));
+#pragma unroll
+                for (int group = 0; group < 6; ++group) {
+                    simd<uint32_t, lanes> packed;
+                    if (group < 4) {
+                        packed = first_words.select<lanes, 1>(group * lanes);
+                    } else {
+                        packed = last_words.select<lanes, 1>((group - 4) * lanes);
+                    }
+                    simd<uint32_t, lanes> v_lo = (packed & 0xff) | ((packed & 0xff00) << 8);
+                    simd<uint32_t, lanes> v_hi = ((packed >> 16) & 0xff) | ((packed & 0xff000000) >> 8);
+#pragma unroll
+                    for (int trit = 0; trit < 5; ++trit) {
+                        const simd<uint32_t, lanes> w_lo = v_lo * 3;
+                        const simd<uint32_t, lanes> w_hi = v_hi * 3;
+                        v_lo = w_lo & 0x00ff00ff; v_hi = w_hi & 0x00ff00ff;
+                        simd<uint32_t, lanes> values = ((w_lo >> 8) & 0xff) | ((w_lo >> 16) & 0xff00) |
+                            ((w_hi << 8) & 0xff0000) | (w_hi & 0xff000000);
+                        values = ((values | 0x80808080u) - 0x01010101u) ^ 0x80808080u;
+                        const simd<int, lanes> w = values.bit_cast_view<int>();
+                        const int element = group < 4 ? trit * 16 + 4 * group : 80 + trit * 8 + 4 * (group - 4);
+                        const int chunk = element / 32;
+                        const simd<int, lanes> a = input_words[chunk].select<lanes, 1>((element % 32) / 4 * lanes);
+                        sums[chunk] = dp4a<int>(sums[chunk], w, a);
+                    }
+                }
+                const simd<uint32_t, lanes> tail_offset = wb + offsetof(block_ptq1_0, qh);
+                const simd<uint32_t, lanes> tail = gather<uint16_t, lanes, 1>(
+                    reinterpret_cast<const uint16_t *>(weights), tail_offset, valid, simd<uint16_t, lanes>(0));
+                simd<uint32_t, lanes> v = (tail & 0xff) | ((tail & 0xff00) << 8);
+#pragma unroll
+                for (int trit = 0; trit < 4; trit += 2) {
+                    const simd<uint32_t, lanes> w0 = v * 3; v = w0 & 0x00ff00ff;
+                    const simd<uint32_t, lanes> w1 = v * 3; v = w1 & 0x00ff00ff;
+                    simd<uint32_t, lanes> values = ((w0 >> 8) & 0xff) | ((w0 >> 16) & 0xff00) |
+                        ((w1 << 8) & 0xff0000) | (w1 & 0xff000000);
+                    values = ((values | 0x80808080u) - 0x01010101u) ^ 0x80808080u;
+                    const simd<int, lanes> w = values.bit_cast_view<int>();
+                    const simd<int, lanes> a = input_words[3].select<lanes, 1>((6 + trit / 2) * lanes);
+                    sums[3] = dp4a<int>(sums[3], w, a);
+                }
+                simd<float, lanes> weighted_sum = 0.0f;
+#pragma unroll
+                for (int chunk = 0; chunk < 4; ++chunk) {
+                    weighted_sum += input_scales[chunk] * simd<float, lanes>(sums[chunk]);
+                }
+                acc += simd<float, lanes>(wd) * weighted_sum;
+            }
+            dst[row] = reduce<float>(acc, std::plus<>{});
+        });
+}
+#endif
+
 static void mul_mat_vec_ptq1_0_q8_1_sycl(const void * vx, const void * vy,
                                          float * dst, const int ncols,
                                          const int nrows,
                                          dpct::queue_ptr stream) {
     GGML_ASSERT(ncols % QK_PTQ1_0 == 0);
+#if defined(__INTEL_LLVM_COMPILER)
+    static const int use_esimd = ggml_sycl_get_env("GGML_SYCL_PTQ1_ESIMD", 0);
+    if (use_esimd && g_ggml_sycl_enable_esimd) {
+        mul_mat_vec_ptq1_0_q8_1_esimd(vx, vy, dst, ncols, nrows, stream);
+        return;
+    }
+#endif
     const int block_num_y = (nrows + GGML_SYCL_MMV_Y - 1) / GGML_SYCL_MMV_Y;
     const sycl::range<3> block_nums(1, 1, block_num_y);
     const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, WARP_SIZE);
@@ -1338,14 +1444,139 @@ static void mul_mat_vec_ptq1_0_q8_1_sycl_switch_ncols(
     }
 }
 
+static int pq2_rows_per_group() {
+    static const int rows = ggml_sycl_get_env("GGML_SYCL_PQ2_ROWS", GGML_SYCL_MMV_Y);
+    GGML_ASSERT(rows > 0 && rows <= 16 && (rows & (rows - 1)) == 0);
+    return rows;
+}
+
+#if defined(__INTEL_LLVM_COMPILER)
+template <int lanes, bool bulk_input, bool aligned_weights = false>
+static void mul_mat_vec_pq2_0_q8_1_esimd_impl(const void * vx, const void * vy, float * dst,
+                                         const int ncols, const int nrows, dpct::queue_ptr stream) {
+    const int rows = pq2_rows_per_group();
+    const sycl::range<1> local(rows);
+    const sycl::range<1> global(((nrows + rows - 1) / rows) * rows);
+    stream->parallel_for(sycl::nd_range<1>(global, local),
+        [=](sycl::nd_item<1> item) [[intel::sycl_explicit_simd]] {
+            using namespace sycl::ext::intel::esimd;
+            const int row = item.get_global_id(0);
+            if (row >= nrows) {
+                return;
+            }
+            const uint8_t * weights = static_cast<const uint8_t *>(vx) +
+                static_cast<size_t>(row) * (ncols / QK_PQ2_0) * sizeof(block_pq2_0);
+            const uint8_t * input = static_cast<const uint8_t *>(vy);
+            simd<float, lanes> acc = 0.0f;
+            const simd<uint32_t, lanes> lane(0, 1);
+            const simd<sycl::half, lanes> zero_half = sycl::half(0.0f);
+            // Each vector lane owns one 32-value activation block.
+            for (int i = 0; i < ncols / QK8_1; i += lanes) {
+                const simd<uint32_t, lanes> q = lane + i;
+                const simd_mask<lanes> valid = q < static_cast<uint32_t>(ncols / QK8_1);
+                const simd<uint32_t, lanes> wb = (q / 4) * sizeof(block_pq2_0);
+                const simd<uint32_t, lanes> wo = wb + 2 + (q % 4) * 8;
+                const simd<uint32_t, lanes> ab = q * sizeof(block_q8_1);
+                const simd<sycl::half, lanes> wd = gather<sycl::half, lanes, 1>(
+                    reinterpret_cast<const sycl::half *>(weights), wb, valid, zero_half);
+                const simd<sycl::half, lanes> ad = gather<sycl::half, lanes, 1>(
+                    reinterpret_cast<const sycl::half *>(input), ab, valid, zero_half);
+                simd<int, lanes * 8> input_words;
+                if constexpr (bulk_input) {
+                    const simd<uint32_t, lanes> input_offsets = ab + 4;
+                    input_words = gather<int, lanes * 8, 8>(reinterpret_cast<const int *>(input),
+                        input_offsets, valid, simd<int, lanes * 8>(0));
+                }
+                simd<uint32_t, lanes * 2> packed_weights;
+                if constexpr (aligned_weights) {
+                    const simd<uint32_t, lanes> alignment = (wo + uint32_t(reinterpret_cast<uintptr_t>(weights) & 3)) & 3;
+                    const simd<uint32_t, lanes> aligned_offsets = wo - alignment;
+                    packed_weights = gather<uint32_t, lanes * 2, 2>(reinterpret_cast<const uint32_t *>(weights),
+                        aligned_offsets, valid, simd<uint32_t, lanes * 2>(0));
+                    const simd_mask<lanes> shifted = valid & (alignment == 2);
+                    const simd<uint32_t, lanes> tail_offsets = wo + 6;
+                    const simd<uint32_t, lanes> tail = gather<uint16_t, lanes, 1>(
+                        reinterpret_cast<const uint16_t *>(weights), tail_offsets, shifted, simd<uint16_t, lanes>(0));
+                    simd<uint32_t, lanes> first = packed_weights.template select<lanes, 1>(0);
+                    simd<uint32_t, lanes> second = packed_weights.template select<lanes, 1>(lanes);
+                    // The final halfword completes an unaligned payload without crossing its block boundary.
+                    first.merge((first >> 16) | (second << 16), shifted);
+                    second.merge((second >> 16) | (tail << 16), shifted);
+                    packed_weights.template select<lanes, 1>(0) = first;
+                    packed_weights.template select<lanes, 1>(lanes) = second;
+                }
+                simd<int, lanes> sum = 0;
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    simd<uint32_t, lanes> pair;
+                    if constexpr (aligned_weights) {
+                        pair = (packed_weights.template select<lanes, 1>((j / 2) * lanes) >> ((j % 2) * 16)) & 0xffff;
+                    } else {
+                        const simd<uint32_t, lanes> offsets = wo + 2 * j;
+                        pair = gather<uint16_t, lanes, 1>(reinterpret_cast<const uint16_t *>(weights),
+                            offsets, valid, simd<uint16_t, lanes>(0));
+                    }
+#pragma unroll
+                    for (int k = 0; k < 2; ++k) {
+                        simd<uint32_t, lanes> values = (pair >> (8 * k)) & 0xff;
+                        values = (values | (values << 12)) & 0x000f000f;
+                        values = (values | (values << 6)) & 0x03030303;
+                        values = ((values | 0x80808080u) - 0x01010101u) ^ 0x80808080u;
+                        const simd<int, lanes> w = values.template bit_cast_view<int>();
+                        const simd<uint32_t, lanes> offsets_a = ab + 4 + 4 * (2 * j + k);
+                        simd<int, lanes> a;
+                        if constexpr (bulk_input) {
+                            a = input_words.template select<lanes, 1>((2 * j + k) * lanes);
+                        } else {
+                            a = gather<int, lanes, 1>(reinterpret_cast<const int *>(input),
+                                offsets_a, valid, simd<int, lanes>(0));
+                        }
+                        sum = dp4a<int>(sum, w, a);
+                    }
+                }
+                acc += simd<float, lanes>(wd) * simd<float, lanes>(ad) * simd<float, lanes>(sum);
+            }
+            dst[row] = reduce<float>(acc, std::plus<>{});
+        });
+}
+template <int lanes>
+static void mul_mat_vec_pq2_0_q8_1_esimd(const void * vx, const void * vy, float * dst,
+                                       const int ncols, const int nrows, dpct::queue_ptr stream) {
+    static const int bulk_input = ggml_sycl_get_env("GGML_SYCL_PQ2_BULK_INPUT", 0);
+    static const int aligned_weights = ggml_sycl_get_env("GGML_SYCL_PQ2_ALIGNED_LOADS", 0);
+    if (bulk_input && aligned_weights) {
+        mul_mat_vec_pq2_0_q8_1_esimd_impl<lanes, true, true>(vx, vy, dst, ncols, nrows, stream);
+    } else if (bulk_input) {
+        mul_mat_vec_pq2_0_q8_1_esimd_impl<lanes, true>(vx, vy, dst, ncols, nrows, stream);
+    } else {
+        mul_mat_vec_pq2_0_q8_1_esimd_impl<lanes, false>(vx, vy, dst, ncols, nrows, stream);
+    }
+}
+#endif
+
 static void mul_mat_vec_pq2_0_q8_1_sycl(const void * vx, const void * vy,
                                         float * dst, const int ncols,
                                         const int nrows,
                                         dpct::queue_ptr stream) {
     GGML_ASSERT(ncols % QK_PQ2_0 == 0);
-    const int block_num_y = (nrows + GGML_SYCL_MMV_Y - 1) / GGML_SYCL_MMV_Y;
+#if defined(__INTEL_LLVM_COMPILER)
+    static const int use_esimd = ggml_sycl_get_env("GGML_SYCL_PQ2_ESIMD", 0);
+    if (use_esimd && g_ggml_sycl_enable_esimd) {
+        static const int lanes = ggml_sycl_get_env("GGML_SYCL_PQ2_LANES", 16);
+        switch (lanes) {
+            case 8:  mul_mat_vec_pq2_0_q8_1_esimd<8> (vx, vy, dst, ncols, nrows, stream); break;
+            case 16: mul_mat_vec_pq2_0_q8_1_esimd<16>(vx, vy, dst, ncols, nrows, stream); break;
+            case 32: mul_mat_vec_pq2_0_q8_1_esimd<32>(vx, vy, dst, ncols, nrows, stream); break;
+            case 64: mul_mat_vec_pq2_0_q8_1_esimd<64>(vx, vy, dst, ncols, nrows, stream); break;
+            default: GGML_ABORT("unsupported PQ2_0 vector width: %d", lanes);
+        }
+        return;
+    }
+#endif
+    const int rows = pq2_rows_per_group();
+    const int block_num_y = (nrows + rows - 1) / rows;
     const sycl::range<3> block_nums(1, 1, block_num_y);
-    const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, WARP_SIZE);
+    const sycl::range<3> block_dims(1, rows, WARP_SIZE);
 
     stream->submit([&](sycl::handler & cgh) {
         cgh.parallel_for(
@@ -1365,9 +1596,10 @@ static void mul_mat_vec_pq2_0_q8_1_sycl_ncols(
         const int stride_col_y, const int stride_col_dst,
         dpct::queue_ptr stream) {
     GGML_ASSERT(ncols % QK_PQ2_0 == 0);
-    const int block_num_y = (nrows + GGML_SYCL_MMV_Y - 1) / GGML_SYCL_MMV_Y;
+    const int rows = pq2_rows_per_group();
+    const int block_num_y = (nrows + rows - 1) / rows;
     const sycl::range<3> block_nums(1, 1, block_num_y);
-    const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, WARP_SIZE);
+    const sycl::range<3> block_dims(1, rows, WARP_SIZE);
 
     stream->submit([&](sycl::handler & cgh) {
         cgh.parallel_for(

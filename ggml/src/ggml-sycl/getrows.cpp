@@ -214,6 +214,37 @@ static void get_rows_sycl_float(ggml_backend_sycl_context & ctx, const ggml_tens
 
     GGML_TENSOR_BINARY_OP_LOCALS
 
+    static const int single_row_copy = ggml_sycl_get_env("GGML_SYCL_SINGLE_ROW_COPY", 0);
+    if constexpr (std::is_same_v<src0_t, float> && std::is_same_v<dst_t, float>) {
+        if (single_row_copy && ne01 == 1 && ne02 == 1 && ne03 == 1 &&
+            ggml_nelements(src1) == 1 && ggml_is_contiguous(src0) && ggml_is_contiguous(dst)) {
+            // A valid index into a single-row tensor is zero.
+            if (dst_dd == src0_dd) {
+                return;
+            }
+            if (single_row_copy == 2) {
+                const int64_t vectors = (ne00 + 3) / 4;
+                const sycl::range<1> local(SYCL_GET_ROWS_BLOCK_SIZE);
+                const sycl::range<1> global(((vectors + local[0] - 1) / local[0]) * local[0]);
+                stream->parallel_for(sycl::nd_range<1>(global, local), [=](sycl::nd_item<1> item) {
+                    const int64_t i = item.get_global_id(0);
+                    if (4 * i + 3 < ne00) {
+                        sycl::vec<src0_t, 4> values;
+                        values.load(i, src0_dd);
+                        values.store(i, dst_dd);
+                    } else {
+                        for (int64_t j = 4 * i; j < ne00; ++j) {
+                            dst_dd[j] = src0_dd[j];
+                        }
+                    }
+                });
+            } else {
+                stream->memcpy(dst_dd, src0_dd, ne00 * sizeof(src0_t));
+            }
+            return;
+        }
+    }
+
     const sycl::range<3> block_dims(1, 1, SYCL_GET_ROWS_BLOCK_SIZE);
     const int block_num_x = (ne00 + SYCL_GET_ROWS_BLOCK_SIZE - 1) / SYCL_GET_ROWS_BLOCK_SIZE;
     const sycl::range<3> block_nums(ne11 * ne12, ne10, block_num_x);

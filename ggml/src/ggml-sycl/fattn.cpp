@@ -247,6 +247,15 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
     const bool can_use_vector_kernel = Q->ne[0] <= 512 && Q->ne[0] % 64 == 0 && K->ne[1] % FATTN_KQ_STRIDE == 0
         && !has_bf16;
 
+    // Single-query decode normally bypasses the vector kernel whenever the grouped-query optimization applies,
+    // because that rule assumes a matrix-engine kernel takes those shapes. This backend has none, so the
+    // vector kernel can serve decode directly on request.
+    static const int decode_vec = ggml_sycl_get_env("GGML_SYCL_FA_DECODE_VEC", 0);
+    if (decode_vec && Q->ne[1] == 1 && can_use_vector_kernel &&
+        !ggml_is_quantized(K->type) && !ggml_is_quantized(V->type)) {
+        return BEST_FATTN_KERNEL_VEC;
+    }
+
     // Fused-XMX path: oneDNN Graph SDPA (flash attention). Strictly
     // additive -- taken only when statically supported, otherwise falls through to VEC/TILE below.
     if (ggml_sycl_flash_attn_ext_onednn_supported(dst)) {
