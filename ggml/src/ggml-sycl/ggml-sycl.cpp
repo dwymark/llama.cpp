@@ -5760,6 +5760,11 @@ static bool check_graph_compatibility(ggml_cgraph * cgraph) {
                               ggml_op_name(node_op));
                 return false;
             case GGML_OP_MUL_MAT:
+                // Multi-column products reach the oneMKL and oneDNN GEMM paths, which wait on events and cannot be
+                // recorded; graphs serve single-token decode.
+                if (cgraph->nodes[i]->src[1]->ne[1] > 1) {
+                    return false;
+                }
                 // We cannot use graphs with ggml_sycl_mul_mat() when SYCL async memory allocation extensions are not available,
                 // as SYCL malloc / free and host wait calls are not supported when recording to a graph which are all present
                 // in reordering.
