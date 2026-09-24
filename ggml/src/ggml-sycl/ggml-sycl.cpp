@@ -5794,7 +5794,7 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
     if (prof_on && marks.size() > 1) {
         marks.back().second.wait();
         const double host_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - host_start).count();
-        using info = sycl::info::event_profiling;
+        namespace info = sycl::info::event_profiling;
         uint64_t prev = marks[0].second.get_profiling_info<info::command_end>();
         const uint64_t first = prev;
         for (size_t k = 1; k < marks.size(); k++) {
