@@ -2682,7 +2682,9 @@ inline void ggml_sycl_op_mul_mat_sycl(
 #ifdef GGML_SYCL_F16
     bool use_fp16 = true;  // TODO(Yu) SYCL capability check
 #else
-    bool use_fp16 = false;
+    // The ternary formats have no MMQ kernel, so prompt batches dequantize into a dense operand and run a
+    // GEMM. Dequantizing to FP16 halves that operand; accumulation stays in FP32.
+    bool use_fp16 = src0->type == GGML_TYPE_PQ2_0 || src0->type == GGML_TYPE_PTQ1_0;
 #endif
 
 #if GGML_SYCL_DNNL && defined(GGML_SYCL_HAS_BF16)
