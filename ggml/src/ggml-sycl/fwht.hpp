@@ -9,4 +9,7 @@
 // ordinary mat-mul dispatch.
 bool ggml_sycl_op_fwht(ggml_backend_sycl_context & ctx, const ggml_tensor * src, ggml_tensor * dst);
 
+// Whether ggml_sycl_op_fwht serves this src/dst pair.
+bool ggml_sycl_fwht_supported(const ggml_tensor * src, const ggml_tensor * dst);
+
 #endif  // GGML_SYCL_FWHT_HPP

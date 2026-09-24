@@ -5763,7 +5763,8 @@ static bool check_graph_compatibility(ggml_cgraph * cgraph) {
                 // Multi-column products reach the oneMKL and oneDNN GEMM paths, which wait on events and cannot be
                 // recorded; graphs serve single-token decode. Hadamard products run the transform kernel instead.
                 if (cgraph->nodes[i]->src[1]->ne[1] > 1 &&
-                    ggml_get_op_params_i32(cgraph->nodes[i], 1) != GGML_HINT_SRC0_IS_HADAMARD) {
+                    !(ggml_get_op_params_i32(cgraph->nodes[i], 1) == GGML_HINT_SRC0_IS_HADAMARD &&
+                      ggml_sycl_fwht_supported(cgraph->nodes[i]->src[1], cgraph->nodes[i]))) {
                     return false;
                 }
                 // We cannot use graphs with ggml_sycl_mul_mat() when SYCL async memory allocation extensions are not available,
