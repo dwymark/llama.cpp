@@ -156,7 +156,7 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
         // integrated GPUs (e.g. unified-memory CUDA devices) report IGPU, not GPU
         const bool is_gpu = ggml_backend_dev_type(ldev.dev) == GGML_BACKEND_DEVICE_TYPE_GPU ||
                             ggml_backend_dev_type(ldev.dev) == GGML_BACKEND_DEVICE_TYPE_IGPU;
-        if (is_gpu && strcmp(reg_name, "MTL") != 0) {
+        if (is_gpu && strcmp(reg_name, "MTL") != 0 && strcmp(reg_name, "SYCL") != 0) {
             gdn_state_rows_dev_ok = false;
         }
         if (strcmp(reg_name, "MTL") != 0 && strcmp(reg_name, "CUDA") != 0 &&
