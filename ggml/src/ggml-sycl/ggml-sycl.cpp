@@ -5752,11 +5752,6 @@ static bool check_graph_compatibility(ggml_cgraph * cgraph) {
         switch (node_op) {
             default:
                 break;
-            case GGML_OP_CONCAT:
-                // ggml_sycl_op_concat() does a blocking host wait after memcpy operations,
-                // but wait() can't be called on the events returned by a queue recording
-                // to a graph.
-                [[fallthrough]];
             case GGML_OP_MUL_MAT_ID:
                 // ggml_sycl_mul_mat_id() does a blocking host wait on the sycl queue after
                 // submitting a memcpy operation, but wait() can't be called on a queue that
@@ -5798,6 +5793,29 @@ static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_
             return GGML_STATUS_SUCCESS;
         }
 
+        std::vector<ggml_backend_sycl_context::graph_node_properties> nodes(cgraph->n_nodes);
+        for (int i = 0; i < cgraph->n_nodes; i++) {
+            const ggml_tensor * node = cgraph->nodes[i];
+            auto & p = nodes[i];
+            memset(&p, 0, sizeof(p));
+            p.data  = node->data;
+            p.op    = node->op;
+            p.flags = node->flags;
+            memcpy(p.ne, node->ne, sizeof(p.ne));
+            memcpy(p.nb, node->nb, sizeof(p.nb));
+            memcpy(p.op_params, node->op_params, sizeof(p.op_params));
+            for (int j = 0; j < GGML_MAX_SRC; j++) {
+                p.src_data[j] = node->src[j] ? node->src[j]->data : nullptr;
+            }
+        }
+        const bool same_nodes = sycl_ctx->exec_graph && nodes.size() == sycl_ctx->exec_graph_nodes.size() &&
+            memcmp(nodes.data(), sycl_ctx->exec_graph_nodes.data(), nodes.size() * sizeof(nodes[0])) == 0;
+        if (same_nodes && sycl_ctx->exec_graph_stable) {
+            sycl_ctx->stream()->ext_oneapi_graph(*(sycl_ctx->exec_graph));
+            return GGML_STATUS_SUCCESS;
+        }
+        sycl_ctx->exec_graph_stable = same_nodes;
+
         sycl_ex::command_graph model_sycl_graph(*(sycl_ctx->stream()), {sycl_ex::property::graph::assume_buffer_outlives_graph{}});
 
         model_sycl_graph.begin_recording(*(sycl_ctx->stream()));
@@ -5822,6 +5840,7 @@ static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_
             }
         }
 
+        sycl_ctx->exec_graph_nodes = std::move(nodes);
         sycl_ctx->stream()->ext_oneapi_graph(*(sycl_ctx->exec_graph));
     } else
 #endif
