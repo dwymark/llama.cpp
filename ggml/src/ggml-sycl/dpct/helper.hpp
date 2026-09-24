@@ -12,6 +12,7 @@
 
 #ifndef GGML_SYCL_DPCT_HELPER_HPP
 #define GGML_SYCL_DPCT_HELPER_HPP
+#define DPCT_PROFILING_ENABLED
 
 #include <cstdlib>
 #include <iostream>
