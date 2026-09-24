@@ -5712,7 +5712,7 @@ static std::string node_profile_key(const ggml_tensor * node, const char * label
     } else if (node->op == GGML_OP_FLASH_ATTN_EXT) {
         snprintf(buf, sizeof(buf), "FLASH_ATTN_EXT kv=%lld", (long long) node->src[1]->ne[1]);
     } else {
-        snprintf(buf, sizeof(buf), "%s %s", ggml_op_desc(node), ggml_type_name(node->type));
+        snprintf(buf, sizeof(buf), "%s %s [%lld %lld %lld]", ggml_op_desc(node), ggml_type_name(node->type), (long long) node->ne[0], (long long) node->ne[1], (long long) node->ne[2]);
     }
     return buf;
 }
@@ -5753,7 +5753,20 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             empties.emplace_back(a, sycl_ctx->stream()->ext_oneapi_submit_barrier());
         }
     };
+    const bool kernel_on = profile_mode == 4 && single_token;
+    std::vector<std::pair<std::string, sycl::event>> kernels;
+    const sycl::event * last_seen = nullptr;
+    sycl::event last_event;
+    auto kmark = [&](const ggml_tensor * node, const char * label) {
+        if (!kernel_on) return;
+        std::optional<sycl::event> e = sycl_ctx->stream()->ext_oneapi_get_last_event();
+        if (!e) return;
+        if (last_seen && *e == last_event) return; // node submitted no new command
+        last_event = *e; last_seen = &last_event;
+        kernels.emplace_back(node_profile_key(node, label), *e);
+    };
     auto mark = [&](const ggml_tensor * node, const char * label) {
+        kmark(node, label);
         if (prof_on) { marks.emplace_back(node_profile_key(node, label), sycl_ctx->stream()->ext_oneapi_submit_barrier()); }
     };
 
@@ -5821,6 +5834,28 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
         GGML_ASSERT(ok);
         mark(node, nullptr);
         submitted++;
+    }
+    if (kernel_on && !kernels.empty()) {
+        sycl_ctx->stream()->wait();
+        namespace info = sycl::info::event_profiling;
+        static std::map<std::string, std::pair<double, long>> acc; static long graphs = 0; static double span = 0, busy = 0;
+        uint64_t first = UINT64_MAX, last = 0; double sum = 0;
+        for (auto & [k, e] : kernels) {
+            const uint64_t a = e.get_profiling_info<info::command_start>(), b = e.get_profiling_info<info::command_end>();
+            acc[k].first += (b - a) * 1e-6; acc[k].second++; sum += (b - a) * 1e-6;
+            first = std::min(first, a); last = std::max(last, b);
+        }
+        span += (last - first) * 1e-6; busy += sum;
+        if (++graphs == 16) {
+            std::vector<std::pair<std::string, std::pair<double, long>>> v(acc.begin(), acc.end());
+            std::sort(v.begin(), v.end(), [](auto & x, auto & y) { return x.second.first > y.second.first; });
+            if (FILE * f = fopen("node_profile.txt", "a")) {
+                fprintf(f, "kernels: %ld graphs, span %.3f ms/graph, summed last-kernel time %.3f ms/graph\n", graphs, span / graphs, busy / graphs);
+                for (auto & [k, r] : v) fprintf(f, "kernels: %9.3f ms/graph %6.1f calls %8.2f us/call  %s\n", r.first / graphs, (double) r.second / graphs, r.first / r.second * 1e3, k.c_str());
+                fclose(f);
+            }
+            acc.clear(); graphs = 0; span = busy = 0;
+        }
     }
     if (bracket_on && !brackets.empty()) {
         sycl_ctx->stream()->wait();
