@@ -5727,9 +5727,9 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
     }
     const bool prof_on = profile && single_token;
     static int diag = 0;
-    if (profile && diag < 6) {
+    if (profile && diag < 40) {
         diag++;
-        if (FILE * f = fopen("node_profile.txt", "a")) { fprintf(f, "diag: nodes=%d single=%d first=%s\n", cgraph->n_nodes, single_token, cgraph->n_nodes ? ggml_op_desc(cgraph->nodes[0]) : "-"); fclose(f); }
+        if (FILE * f = fopen("node_profile.txt", "a")) { fprintf(f, "diag: nodes=%d single=%d first=%s src0=%s [%lld %lld %lld %lld] src1 [%lld %lld %lld %lld]\n", cgraph->n_nodes, single_token, ggml_op_desc(cgraph->nodes[0]), cgraph->nodes[0]->src[0] ? ggml_type_name(cgraph->nodes[0]->src[0]->type) : "-", (long long) cgraph->nodes[0]->src[0]->ne[0], (long long) cgraph->nodes[0]->src[0]->ne[1], (long long) cgraph->nodes[0]->src[0]->ne[2], (long long) cgraph->nodes[0]->src[0]->ne[3], (long long) cgraph->nodes[0]->src[1]->ne[0], (long long) cgraph->nodes[0]->src[1]->ne[1], (long long) cgraph->nodes[0]->src[1]->ne[2], (long long) cgraph->nodes[0]->src[1]->ne[3]); fclose(f); }
     }
     std::vector<std::pair<std::string, sycl::event>> marks;
     const auto host_start = std::chrono::steady_clock::now();
