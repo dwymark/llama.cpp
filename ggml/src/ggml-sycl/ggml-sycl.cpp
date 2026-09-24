@@ -5723,11 +5723,11 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
     bool single_token = false;
     for (int k = 0; k < cgraph->n_nodes; k++) {
         const ggml_tensor * t = cgraph->nodes[k];
-        if (t->op == GGML_OP_MUL_MAT) { single_token = t->src[1]->ne[1] == 1; break; }
+        if (t->op == GGML_OP_MUL_MAT && ggml_is_quantized(t->src[0]->type)) { single_token = t->src[1]->ne[1] == 1; break; }
     }
     const bool prof_on = profile && single_token;
     static int diag = 0;
-    if (profile && diag < 40) {
+    if (profile && diag < 0) {
         diag++;
         if (FILE * f = fopen("node_profile.txt", "a")) { fprintf(f, "diag: nodes=%d single=%d first=%s src0=%s [%lld %lld %lld %lld] src1 [%lld %lld %lld %lld]\n", cgraph->n_nodes, single_token, ggml_op_desc(cgraph->nodes[0]), cgraph->nodes[0]->src[0] ? ggml_type_name(cgraph->nodes[0]->src[0]->type) : "-", (long long) cgraph->nodes[0]->src[0]->ne[0], (long long) cgraph->nodes[0]->src[0]->ne[1], (long long) cgraph->nodes[0]->src[0]->ne[2], (long long) cgraph->nodes[0]->src[0]->ne[3], (long long) cgraph->nodes[0]->src[1]->ne[0], (long long) cgraph->nodes[0]->src[1]->ne[1], (long long) cgraph->nodes[0]->src[1]->ne[2], (long long) cgraph->nodes[0]->src[1]->ne[3]); fclose(f); }
     }
