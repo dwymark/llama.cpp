@@ -723,13 +723,19 @@ static void flash_attn_tile(const char *  Q,
 
     const int col_Q_0 = item_ct1.get_group(2) * ncols1;  // Index of the first Q column for this SYCL block to work on.
 
-    const int           sequence  = item_ct1.get_group(0) / (ne02 / ncols2);
-    const int           head0     = item_ct1.get_group(0) * ncols2 - sequence * ne02;  // == item_ct1.get_group(0) % (ne02/ncols2)
-    const int gqa_ratio = ne02 / ne12; // With grouped query attention there are > 1 Q matrices per K, V matrix.
+    // Each work-group covers ncols2 Q heads of one K/V head. When ncols2 does not divide the GQA ratio, the last
+    // tile of each K/V head is padded: its extra columns load zeros and are never written.
+    const int gqa_ratio    = ne02 / ne12; // With grouped query attention there are > 1 Q matrices per K, V matrix.
+    const int ntiles_z_gqa = (gqa_ratio + ncols2 - 1) / ncols2;
+    const int sequence     = item_ct1.get_group(0) / (ntiles_z_gqa * ne12);
+    const int z_KV         = (item_ct1.get_group(0) / ntiles_z_gqa) % ne12;
+    const int zt_gqa       = item_ct1.get_group(0) % ntiles_z_gqa;
+    const int head0        = z_KV * gqa_ratio + zt_gqa * ncols2;
+    const int ncols2_valid = sycl::min(ncols2, gqa_ratio - zt_gqa * ncols2);
     const float * Q_f  = (const float *) (Q + nb03*sequence + nb02* head0);
-    const sycl::half2 * K_h2      = (const sycl::half2 *) (K + nb13 * sequence + nb12 * (head0 / gqa_ratio));
+    const sycl::half2 * K_h2      = (const sycl::half2 *) (K + nb13 * sequence + nb12 * z_KV);
     const sycl::half2 * V_h2 =
-        (const sycl::half2 *) (V + nb23 * sequence + nb22 * (head0 / gqa_ratio));  // K and V have same shape
+        (const sycl::half2 *) (V + nb23 * sequence + nb22 * z_KV);  // K and V have same shape
 
     const sycl::half * maskh = mask ? (const sycl::half *) (mask + nb33 * (sequence % ne33)) : nullptr;
 
@@ -823,10 +829,12 @@ static void flash_attn_tile(const char *  Q,
                 i0 + (item_ct1.get_local_id(1) % np) * (warp_size * cpy_ne_D) + item_ct1.get_local_id(2) * cpy_ne_D <
                     DKQ) {
                 __dpct_align__(16) float tmp_f[cpy_ne_D] = { 0.0f };
-                ggml_sycl_memcpy_1<sizeof(tmp_f)>(
-                    tmp_f, &Q_f[c * (nb02 / sizeof(float)) + fastmodulo(col_Q_0 + j, ne01) * (nb01 / sizeof(float)) +
-                                i0 + (item_ct1.get_local_id(1) % np) * (warp_size * cpy_ne_D) +
-                                item_ct1.get_local_id(2) * cpy_ne_D]);
+                if (c < ncols2_valid) {
+                    ggml_sycl_memcpy_1<sizeof(tmp_f)>(
+                        tmp_f, &Q_f[c * (nb02 / sizeof(float)) + fastmodulo(col_Q_0 + j, ne01) * (nb01 / sizeof(float)) +
+                                    i0 + (item_ct1.get_local_id(1) % np) * (warp_size * cpy_ne_D) +
+                                    item_ct1.get_local_id(2) * cpy_ne_D]);
+                }
 
 #pragma unroll
                 for (int i1 = 0; i1 < cpy_ne_D; ++i1) {
@@ -974,7 +982,7 @@ static void flash_attn_tile(const char *  Q,
 #pragma unroll
         for (int jc0 = 0; jc0 < cpw; ++jc0) {
             const int   jc   = jc0 + (item_ct1.get_local_id(1) / np) * cpw;
-            const float sink = ((const float *) sinks)[head0 + jc % ncols2];
+            const float sink = jc % ncols2 < ncols2_valid ? ((const float *) sinks)[head0 + jc % ncols2] : 0.0f;
 
             float       KQ_max_new_j = sycl::fmax((float) KQ_max[jc0], sink);
             const float KQ_max_scale = sycl::native::exp((float) (KQ_max[jc0] - KQ_max_new_j));
@@ -1009,6 +1017,9 @@ static void flash_attn_tile(const char *  Q,
 
         if (ncols1 > 1 && col_Q_0 + j >= int(ne01.z())) {
             return;
+        }
+        if (c >= ncols2_valid) {
+            continue;
         }
 
         const float scale = item_ct1.get_group_range(1) == 1 ? 1.0f / KQ_sum[jc0] : 1.0f;
@@ -1190,7 +1201,8 @@ static void launch_fattn_tile_switch_ncols2(ggml_backend_sycl_context & ctx, ggm
     }
 
     if constexpr (DV <= 256) {
-        if (use_gqa_opt && gqa_ratio % 8 == 0) {
+        // Ratios 5 to 7 use one padded tile of eight so each K/V head is read once.
+        if (use_gqa_opt && (gqa_ratio % 8 == 0 || (gqa_ratio > 4 && gqa_ratio < 8))) {
             launch_fattn_tile_switch_ncols1<DKQ, DV, 8, use_logit_softcap>(ctx, dst);
             return;
         }
