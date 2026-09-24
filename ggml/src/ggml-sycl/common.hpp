@@ -470,6 +470,19 @@ struct ggml_backend_sycl_context {
 
 #ifdef GGML_SYCL_GRAPH
     std::unique_ptr<sycl_ex::command_graph<sycl_ex::graph_state::executable>> exec_graph = nullptr;
+    // Properties of the nodes recorded into exec_graph; a graph whose nodes all match is replayed without recording.
+    struct graph_node_properties {
+        void *   data;
+        int      op;
+        int64_t  ne[GGML_MAX_DIMS];
+        size_t   nb[GGML_MAX_DIMS];
+        void *   src_data[GGML_MAX_SRC];
+        int32_t  op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t)];
+        int32_t  flags;
+    };
+    std::vector<graph_node_properties> exec_graph_nodes;
+    // Set once a recording matched the one before it, so one-time work from a first call is never replayed.
+    bool exec_graph_stable = false;
 #endif
 
     ggml_sycl_pool & host_pool(int device) {
