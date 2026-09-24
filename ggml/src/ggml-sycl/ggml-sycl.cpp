@@ -5725,7 +5725,10 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
         const ggml_tensor * t = cgraph->nodes[k];
         if (t->op == GGML_OP_MUL_MAT && ggml_is_quantized(t->src[0]->type)) { single_token = t->src[1]->ne[1] == 1; break; }
     }
-    const bool prof_on = profile && single_token;
+    static const int profile_mode = ggml_sycl_get_env("GGML_SYCL_NODE_PROFILE", 0);
+    const bool prof_on = profile_mode == 1 && single_token;
+    const bool host_only = profile_mode == 2 && single_token;
+    int submitted = 0;
     static int diag = 0;
     if (profile && diag < 0) {
         diag++;
@@ -5799,6 +5802,16 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
         }
         GGML_ASSERT(ok);
         mark(node, nullptr);
+        submitted++;
+    }
+    if (host_only) {
+        static double host_ms = 0; static long n = 0, nodes = 0;
+        host_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - host_start).count();
+        nodes += submitted; n++;
+        if (n == 32) {
+            if (FILE * f = fopen("node_profile.txt", "a")) { fprintf(f, "host_submit: %.3f ms/graph over %ld graphs, %.0f unfused nodes/graph\n", host_ms / n, n, (double) nodes / n); fclose(f); }
+            host_ms = 0; n = 0; nodes = 0;
+        }
     }
     if (prof_on && marks.size() > 1) {
         marks.back().second.wait();
