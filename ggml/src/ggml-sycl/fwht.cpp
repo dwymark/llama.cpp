@@ -134,7 +134,9 @@ static void fwht_kernel_wide(const float * __restrict__ src,
                              const int64_t            n_rows,
                              const float              scale,
                              const sycl::nd_item<2> & item,
-                             float *                  smem) {
+                             float *                  smem,
+                             const float * __restrict__ signs,
+                             const int                n_blk) {
     const int64_t r = item.get_global_id(0);
     if (r >= n_rows) {
         return;
@@ -152,6 +154,14 @@ static void fwht_kernel_wide(const float * __restrict__ src,
 #pragma unroll
     for (int i = 0; i < el_w; ++i) {
         reg[i] = src[i * NT + tid] * scale;
+    }
+    // Hadamard sign flip fused into the load: row r is block r % n_blk of the signed activation.
+    if (signs != nullptr) {
+        const float * signs_row = signs + (r % n_blk) * N;
+#pragma unroll
+        for (int i = 0; i < el_w; ++i) {
+            reg[i] *= signs_row[i * NT + tid];
+        }
     }
 
     const sycl::sub_group sg   = item.get_sub_group();
@@ -212,7 +222,9 @@ static void launch_fwht_wide(const float *   src,
                              float *         dst,
                              const int64_t   n_rows,
                              const float     scale,
-                             dpct::queue_ptr stream) {
+                             dpct::queue_ptr stream,
+                             const float *   signs = nullptr,
+                             const int       n_blk = 1) {
     const sycl::range<2> global(n_rows, NT);
     const sycl::range<2> local(1, NT);
 
@@ -220,7 +232,7 @@ static void launch_fwht_wide(const float *   src,
         sycl::local_accessor<float, 1> smem(sycl::range<1>(N), cgh);
         cgh.parallel_for(sycl::nd_range<2>(global, local),
                          [=](sycl::nd_item<2> item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-                             fwht_kernel_wide<N, NT>(src, dst, n_rows, scale, item, get_pointer(smem));
+                             fwht_kernel_wide<N, NT>(src, dst, n_rows, scale, item, get_pointer(smem), signs, n_blk);
                          });
     });
 }
@@ -400,5 +412,32 @@ bool ggml_sycl_op_fwht(ggml_backend_sycl_context & ctx, const ggml_tensor * src,
             return true;
         default:
             return false;
+    }
+}
+
+bool ggml_sycl_op_fwht_signed(ggml_backend_sycl_context & ctx, const ggml_tensor * x, const ggml_tensor * signs, ggml_tensor * dst) {
+    if (x->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 || signs->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (!ggml_is_contiguous(x) || !ggml_is_contiguous(dst) || !ggml_is_contiguous(signs)) {
+        return false;
+    }
+    const int n = (int) dst->ne[0];
+    if (signs->ne[0] != x->ne[0] || signs->ne[0] % n != 0 || ggml_nelements(x) != ggml_nelements(dst)) {
+        return false;
+    }
+    const int64_t   rows   = ggml_nelements(dst) / n;
+    const int       n_blk  = (int) (signs->ne[0] / n);
+    const float *   src_d  = (const float *) x->data;
+    const float *   s_d    = (const float *) signs->data;
+    float *         dst_d  = (float *) dst->data;
+    dpct::queue_ptr stream = ctx.stream();
+    const float     scale  = 1.0f / std::sqrt((float) n);
+    switch (n) {
+        case 1024: launch_fwht_wide<1024, 256>(src_d, dst_d, rows, scale, stream, s_d, n_blk); return true;
+        case 2048: launch_fwht_wide<2048, 256>(src_d, dst_d, rows, scale, stream, s_d, n_blk); return true;
+        case 4096: launch_fwht_wide<4096, 256>(src_d, dst_d, rows, scale, stream, s_d, n_blk); return true;
+        case 8192: launch_fwht_wide<8192, 256>(src_d, dst_d, rows, scale, stream, s_d, n_blk); return true;
+        default:   return false;
     }
 }

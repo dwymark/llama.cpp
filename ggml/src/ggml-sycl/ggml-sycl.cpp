@@ -5713,6 +5713,19 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
                 continue;
             }
         }
+        // Hadamard sign flip + reshape + transform matmul: the transform applies the signs as it loads.
+        if (node->op == GGML_OP_MUL &&
+            ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_MUL, GGML_OP_RESHAPE, GGML_OP_MUL_MAT }, { i + 2 })) {
+            const ggml_tensor * reshape = cgraph->nodes[i + 1];
+            ggml_tensor *       mm      = cgraph->nodes[i + 2];
+            const ggml_tensor * signs   = node->src[1];
+            if (ggml_get_op_params_i32(mm, 1) == GGML_HINT_SRC0_IS_HADAMARD && mm->src[1] == reshape &&
+                reshape->src[0] == node && ggml_nrows(signs) == 1 && node->type == node->src[0]->type &&
+                ggml_sycl_op_fwht_signed(*sycl_ctx, node->src[0], signs, mm)) {
+                i += 2;
+                continue;
+            }
+        }
         if (node->op == GGML_OP_RMS_NORM &&
             ggml_sycl_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL }, {})) {
             ggml_sycl_op_rms_norm_fused(*sycl_ctx, node, cgraph->nodes[i + 1]);
