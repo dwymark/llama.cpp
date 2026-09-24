@@ -5687,14 +5687,18 @@ struct node_profile {
     struct row { double ms = 0; double idle_ms = 0; long n = 0; };
     std::map<std::string, row> rows;
     long graphs = 0; double total_ms = 0; double wall_ms = 0;
-    ~node_profile() {
+    void dump() {
         if (!graphs) return;
+        FILE * f = fopen("node_profile.txt", "a");
+        if (!f) return;
         std::vector<std::pair<std::string, row>> v(rows.begin(), rows.end());
         std::sort(v.begin(), v.end(), [](auto & a, auto & b) { return a.second.ms > b.second.ms; });
-        fprintf(stderr, "node_profile: %ld single-token graphs, device span %.3f ms/graph, host wall %.3f ms/graph\n", graphs, total_ms / graphs, wall_ms / graphs);
+        fprintf(f, "node_profile: %ld single-token graphs, device span %.3f ms/graph, host wall %.3f ms/graph\n", graphs, total_ms / graphs, wall_ms / graphs);
         for (auto & [k, r] : v) {
-            fprintf(stderr, "node_profile: %9.3f ms/graph %8.3f idle %6.1f calls/graph  %s\n", r.ms / graphs, r.idle_ms / graphs, (double) r.n / graphs, k.c_str());
+            fprintf(f, "node_profile: %9.3f ms/graph %8.3f idle %6.1f calls/graph  %s\n", r.ms / graphs, r.idle_ms / graphs, (double) r.n / graphs, k.c_str());
         }
+        fclose(f);
+        rows.clear(); graphs = 0; total_ms = 0; wall_ms = 0;
     }
 };
 static node_profile g_node_profile;
@@ -5809,6 +5813,9 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
         g_node_profile.graphs++;
         g_node_profile.total_ms += (prev - first) * 1e-6;
         g_node_profile.wall_ms += host_ms;
+        if (g_node_profile.graphs == 32) {
+            g_node_profile.dump();
+        }
     }
 }
 
