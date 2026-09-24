@@ -11,6 +11,9 @@
 //
 
 #include <algorithm>
+#include <chrono>
+#include <map>
+#include <string>
 #include <array>
 #include <assert.h>
 #include <atomic>
@@ -5678,8 +5681,53 @@ static int ggml_sycl_try_gdn_cache_fusion(const ggml_cgraph * cgraph, int node_i
     return skip;
 }
 
+// Local attribution tool: with GGML_SYCL_NODE_PROFILE=1 and queues built with DPCT_PROFILING_ENABLED, a barrier
+// after each executed node records device timestamps; single-token graphs are aggregated and printed at exit.
+struct node_profile {
+    struct row { double ms = 0; double idle_ms = 0; long n = 0; };
+    std::map<std::string, row> rows;
+    long graphs = 0; double total_ms = 0; double wall_ms = 0;
+    ~node_profile() {
+        if (!graphs) return;
+        std::vector<std::pair<std::string, row>> v(rows.begin(), rows.end());
+        std::sort(v.begin(), v.end(), [](auto & a, auto & b) { return a.second.ms > b.second.ms; });
+        fprintf(stderr, "node_profile: %ld single-token graphs, device span %.3f ms/graph, host wall %.3f ms/graph\n", graphs, total_ms / graphs, wall_ms / graphs);
+        for (auto & [k, r] : v) {
+            fprintf(stderr, "node_profile: %9.3f ms/graph %8.3f idle %6.1f calls/graph  %s\n", r.ms / graphs, r.idle_ms / graphs, (double) r.n / graphs, k.c_str());
+        }
+    }
+};
+static node_profile g_node_profile;
+
+static std::string node_profile_key(const ggml_tensor * node, const char * label) {
+    char buf[256];
+    if (label) {
+        snprintf(buf, sizeof(buf), "%s [%s %lldx%lld]", label, ggml_op_desc(node), (long long) node->ne[0], (long long) node->ne[1]);
+    } else if (node->op == GGML_OP_MUL_MAT && node->src[0]) {
+        snprintf(buf, sizeof(buf), "MUL_MAT %s %lldx%lld n=%lld", ggml_type_name(node->src[0]->type), (long long) node->src[0]->ne[1], (long long) node->src[0]->ne[0], (long long) node->src[1]->ne[1]);
+    } else if (node->op == GGML_OP_FLASH_ATTN_EXT) {
+        snprintf(buf, sizeof(buf), "FLASH_ATTN_EXT kv=%lld", (long long) node->src[1]->ne[1]);
+    } else {
+        snprintf(buf, sizeof(buf), "%s %s", ggml_op_desc(node), ggml_type_name(node->type));
+    }
+    return buf;
+}
+
 static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * sycl_ctx, ggml_cgraph * cgraph) {
     ggml_sycl_set_main_device(sycl_ctx->device);
+    static const bool profile = ggml_sycl_get_env("GGML_SYCL_NODE_PROFILE", 0) != 0;
+    bool single_token = false;
+    for (int k = 0; k < cgraph->n_nodes; k++) {
+        const ggml_tensor * t = cgraph->nodes[k];
+        if (t->op == GGML_OP_MUL_MAT) { single_token = t->src[1]->ne[1] == 1; break; }
+    }
+    const bool prof_on = profile && single_token;
+    std::vector<std::pair<std::string, sycl::event>> marks;
+    const auto host_start = std::chrono::steady_clock::now();
+    if (prof_on) { marks.emplace_back("start", sycl_ctx->stream()->ext_oneapi_submit_barrier()); }
+    auto mark = [&](const ggml_tensor * node, const char * label) {
+        if (prof_on) { marks.emplace_back(node_profile_key(node, label), sycl_ctx->stream()->ext_oneapi_submit_barrier()); }
+    };
 
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_tensor * node = cgraph->nodes[i];
@@ -5692,6 +5740,7 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
 
         const int nodes_to_skip = ggml_sycl_fuse(*sycl_ctx, cgraph, i);
         if (nodes_to_skip != 0) {
+            mark(node, "fused");
             i += nodes_to_skip;
             continue;
         }
@@ -5709,6 +5758,7 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             const int gdn_nodes_to_skip = ggml_sycl_try_gdn_cache_fusion(cgraph, i, fused_state_cpy);
             if (gdn_nodes_to_skip > 0) {
                 ggml_sycl_op_gated_delta_net_fused_cache(*sycl_ctx, node, fused_state_cpy);
+                mark(node, "gdn+cache");
                 i += gdn_nodes_to_skip;
                 continue;
             }
@@ -5716,17 +5766,20 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
         if (node->op == GGML_OP_RMS_NORM &&
             ggml_sycl_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL }, {})) {
             ggml_sycl_op_rms_norm_fused(*sycl_ctx, node, cgraph->nodes[i + 1]);
+            mark(node, "rms_norm+mul");
             i++;
             continue;
         }
         if (node->op == GGML_OP_UNARY &&
             ggml_sycl_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { ggml_get_unary_op(node) })) {
             ggml_sycl_op_unary_mul_fused(*sycl_ctx, node, cgraph->nodes[i + 1]);
+            mark(node, "unary+mul");
             i++;
             continue;
         }
 
         if (node->op == GGML_OP_MUL_MAT && ggml_sycl_mul_mat_glu_mmvq_fused(*sycl_ctx, cgraph, i)) {
+            mark(node, "mmvq_glu");
             i += 2;
             continue;
         }
@@ -5736,6 +5789,26 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             GGML_LOG_ERROR("%s: error: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
         }
         GGML_ASSERT(ok);
+        mark(node, nullptr);
+    }
+    if (prof_on && marks.size() > 1) {
+        marks.back().second.wait();
+        const double host_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - host_start).count();
+        using info = sycl::info::event_profiling;
+        uint64_t prev = marks[0].second.get_profiling_info<info::command_end>();
+        const uint64_t first = prev;
+        for (size_t k = 1; k < marks.size(); k++) {
+            const uint64_t end = marks[k].second.get_profiling_info<info::command_end>();
+            const uint64_t submit = marks[k].second.get_profiling_info<info::command_submit>();
+            auto & r = g_node_profile.rows[marks[k].first];
+            r.ms += (end - prev) * 1e-6;
+            r.idle_ms += submit > prev ? (submit - prev) * 1e-6 : 0.0;
+            r.n++;
+            prev = end;
+        }
+        g_node_profile.graphs++;
+        g_node_profile.total_ms += (prev - first) * 1e-6;
+        g_node_profile.wall_ms += host_ms;
     }
 }
 
