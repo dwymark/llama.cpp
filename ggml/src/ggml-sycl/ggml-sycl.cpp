@@ -5737,6 +5737,22 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
     std::vector<std::pair<std::string, sycl::event>> marks;
     const auto host_start = std::chrono::steady_clock::now();
     if (prof_on) { marks.emplace_back("start", sycl_ctx->stream()->ext_oneapi_submit_barrier()); }
+    static const char * bracket_op = getenv("GGML_SYCL_NODE_PROFILE_OP");
+    const bool bracket_on = profile_mode == 3 && single_token && bracket_op;
+    std::vector<std::pair<sycl::event, sycl::event>> brackets;
+    std::vector<std::pair<sycl::event, sycl::event>> empties;
+    auto bracket_begin = [&](const ggml_tensor * node) -> bool {
+        if (!bracket_on || strcmp(ggml_op_desc(node), bracket_op) != 0) return false;
+        brackets.emplace_back(sycl_ctx->stream()->ext_oneapi_submit_barrier(), sycl::event());
+        return true;
+    };
+    auto bracket_end = [&]() {
+        brackets.back().second = sycl_ctx->stream()->ext_oneapi_submit_barrier();
+        if (empties.size() < 8) {
+            auto a = sycl_ctx->stream()->ext_oneapi_submit_barrier();
+            empties.emplace_back(a, sycl_ctx->stream()->ext_oneapi_submit_barrier());
+        }
+    };
     auto mark = [&](const ggml_tensor * node, const char * label) {
         if (prof_on) { marks.emplace_back(node_profile_key(node, label), sycl_ctx->stream()->ext_oneapi_submit_barrier()); }
     };
@@ -5796,13 +5812,29 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             continue;
         }
 
+        const bool bracketed = bracket_begin(node);
         bool ok = ggml_sycl_compute_forward(*sycl_ctx, node);
+        if (bracketed) bracket_end();
         if (!ok) {
             GGML_LOG_ERROR("%s: error: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
         }
         GGML_ASSERT(ok);
         mark(node, nullptr);
         submitted++;
+    }
+    if (bracket_on && !brackets.empty()) {
+        sycl_ctx->stream()->wait();
+        namespace info = sycl::info::event_profiling;
+        static double op_us = 0, empty_us = 0; static long calls = 0, nempty = 0, graphs = 0;
+        for (auto & [a, b] : brackets) { op_us += (b.get_profiling_info<info::command_end>() - a.get_profiling_info<info::command_end>()) * 1e-3; calls++; }
+        for (auto & [a, b] : empties) { empty_us += (b.get_profiling_info<info::command_end>() - a.get_profiling_info<info::command_end>()) * 1e-3; nempty++; }
+        if (++graphs == 16) {
+            if (FILE * f = fopen("node_profile.txt", "a")) {
+                fprintf(f, "bracket %s: %.1f calls/graph, %.2f us/call raw, %.2f us empty bracket, %.3f ms/graph net\n", bracket_op, (double) calls / graphs, op_us / calls, empty_us / nempty, (op_us / calls - empty_us / nempty) * calls / graphs * 1e-3);
+                fclose(f);
+            }
+            op_us = empty_us = 0; calls = nempty = graphs = 0;
+        }
     }
     if (host_only) {
         static double host_ms = 0; static long n = 0, nodes = 0;
