@@ -5817,9 +5817,20 @@ static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_
         }
         const bool same_nodes = sycl_ctx->exec_graph && nodes.size() == sycl_ctx->exec_graph_nodes.size() &&
             memcmp(nodes.data(), sycl_ctx->exec_graph_nodes.data(), nodes.size() * sizeof(nodes[0])) == 0;
+        static long dbg_replays = 0, dbg_records = 0; static int dbg_first_diff = -1;
+        if (getenv("GGML_SYCL_GRAPH_DEBUG") && (dbg_replays + dbg_records) % 16 == 15) {
+            if (FILE * f = fopen("graph_debug.txt", "a")) { fprintf(f, "replays=%ld records=%ld nodes=%zu last_first_diff=%d\n", dbg_replays, dbg_records, nodes.size(), dbg_first_diff); fclose(f); }
+        }
         if (same_nodes && sycl_ctx->exec_graph_stable) {
+            dbg_replays++;
             sycl_ctx->stream()->ext_oneapi_graph(*(sycl_ctx->exec_graph));
             return GGML_STATUS_SUCCESS;
+        }
+        dbg_records++;
+        if (sycl_ctx->exec_graph && nodes.size() == sycl_ctx->exec_graph_nodes.size()) {
+            for (size_t k = 0; k < nodes.size(); k++) {
+                if (memcmp(&nodes[k], &sycl_ctx->exec_graph_nodes[k], sizeof(nodes[k])) != 0) { dbg_first_diff = (int) k; break; }
+            }
         }
         sycl_ctx->exec_graph_stable = same_nodes;
 
