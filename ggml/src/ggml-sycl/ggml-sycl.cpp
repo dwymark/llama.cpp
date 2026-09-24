@@ -5726,6 +5726,11 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
         if (t->op == GGML_OP_MUL_MAT) { single_token = t->src[1]->ne[1] == 1; break; }
     }
     const bool prof_on = profile && single_token;
+    static int diag = 0;
+    if (profile && diag < 6) {
+        diag++;
+        if (FILE * f = fopen("node_profile.txt", "a")) { fprintf(f, "diag: nodes=%d single=%d first=%s\n", cgraph->n_nodes, single_token, cgraph->n_nodes ? ggml_op_desc(cgraph->nodes[0]) : "-"); fclose(f); }
+    }
     std::vector<std::pair<std::string, sycl::event>> marks;
     const auto host_start = std::chrono::steady_clock::now();
     if (prof_on) { marks.emplace_back("start", sycl_ctx->stream()->ext_oneapi_submit_barrier()); }
