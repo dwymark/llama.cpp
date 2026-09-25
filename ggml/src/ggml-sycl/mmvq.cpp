@@ -1526,6 +1526,112 @@ static void mul_mat_vec_pq2_0_q8_1_esimd(const void * vx, const void * vy, float
             dst[row] = reduce<float>(acc, std::plus<>{});
         });
 }
+
+// Several activation columns against a few weight rows: each thread owns rows_per_thread consecutive rows,
+// decodes their weight bytes once, and gathers each column's activations once for all of its rows, so a
+// batch of up to eight tokens reads the weights once and the activations once per row group.
+template <int ncols_dst, int rows_per_thread>
+static void mul_mat_vec_pq2_0_q8_1_esimd_ncols(const void * vx, const void * vy, float * dst,
+                                               const int ncols, const int nrows,
+                                               const int stride_col_y, const int stride_col_dst,
+                                               dpct::queue_ptr stream) {
+    constexpr int lanes = MMVQ_ESIMD_LANES;
+    constexpr int threads = MMVQ_ESIMD_ROWS_PER_WG;
+    const int nthreads = (nrows + rows_per_thread - 1) / rows_per_thread;
+    const sycl::range<1> local(threads);
+    const sycl::range<1> global(((nthreads + threads - 1) / threads) * threads);
+    stream->parallel_for(sycl::nd_range<1>(global, local),
+        [=](sycl::nd_item<1> item) [[intel::sycl_explicit_simd]] {
+            using namespace sycl::ext::intel::esimd;
+            const int row0 = item.get_global_id(0) * rows_per_thread;
+            if (row0 >= nrows) {
+                return;
+            }
+            const size_t row_bytes = static_cast<size_t>(ncols / QK_PQ2_0) * sizeof(block_pq2_0);
+            const uint8_t * input = static_cast<const uint8_t *>(vy);
+            const uint32_t col_bytes = static_cast<uint32_t>(stride_col_y) * sizeof(block_q8_1);
+            simd<float, lanes> acc[ncols_dst][rows_per_thread];
+#pragma unroll
+            for (int c = 0; c < ncols_dst; ++c) {
+#pragma unroll
+                for (int r = 0; r < rows_per_thread; ++r) {
+                    acc[c][r] = 0.0f;
+                }
+            }
+            const simd<uint32_t, lanes> lane(0, 1);
+            const simd<sycl::half, lanes> zero_half = sycl::half(0.0f);
+            for (int i = 0; i < ncols / QK8_1; i += lanes) {
+                const simd<uint32_t, lanes> q = lane + i;
+                const simd_mask<lanes> valid = q < static_cast<uint32_t>(ncols / QK8_1);
+                const simd<uint32_t, lanes> wb = (q / 4) * sizeof(block_pq2_0);
+                const simd<uint32_t, lanes> wo = wb + 2 + (q % 4) * 8;
+                const simd<uint32_t, lanes> ab = q * sizeof(block_q8_1);
+
+                simd<float, lanes> wd[rows_per_thread];
+                simd<int, lanes * 8> w[rows_per_thread];
+#pragma unroll
+                for (int r = 0; r < rows_per_thread; ++r) {
+                    const int row = row0 + r < nrows ? row0 + r : nrows - 1;
+                    const uint8_t * weights = static_cast<const uint8_t *>(vx) + static_cast<size_t>(row) * row_bytes;
+                    wd[r] = simd<float, lanes>(gather<sycl::half, lanes, 1>(
+                        reinterpret_cast<const sycl::half *>(weights), wb, valid, zero_half));
+                    const simd<uint32_t, lanes> alignment = (wo + uint32_t(reinterpret_cast<uintptr_t>(weights) & 3)) & 3;
+                    const simd<uint32_t, lanes> aligned_offsets = wo - alignment;
+                    simd<uint32_t, lanes * 2> packed_weights = gather<uint32_t, lanes * 2, 2>(
+                        reinterpret_cast<const uint32_t *>(weights), aligned_offsets, valid, simd<uint32_t, lanes * 2>(0));
+                    const simd_mask<lanes> shifted = valid & (alignment == 2);
+                    const simd<uint32_t, lanes> tail_offsets = wo + 6;
+                    const simd<uint32_t, lanes> tail = gather<uint16_t, lanes, 1>(
+                        reinterpret_cast<const uint16_t *>(weights), tail_offsets, shifted, simd<uint16_t, lanes>(0));
+                    simd<uint32_t, lanes> first = packed_weights.select<lanes, 1>(0);
+                    simd<uint32_t, lanes> second = packed_weights.select<lanes, 1>(lanes);
+                    first.merge((first >> 16) | (second << 16), shifted);
+                    second.merge((second >> 16) | (tail << 16), shifted);
+#pragma unroll
+                    for (int j = 0; j < 4; ++j) {
+                        const simd<uint32_t, lanes> pair = ((j < 2 ? first : second) >> ((j % 2) * 16)) & 0xffff;
+#pragma unroll
+                        for (int k = 0; k < 2; ++k) {
+                            simd<uint32_t, lanes> values = (pair >> (8 * k)) & 0xff;
+                            values = (values | (values << 12)) & 0x000f000f;
+                            values = (values | (values << 6)) & 0x03030303;
+                            values = ((values | 0x80808080u) - 0x01010101u) ^ 0x80808080u;
+                            w[r].template select<lanes, 1>((2 * j + k) * lanes) = values.bit_cast_view<int>();
+                        }
+                    }
+                }
+
+#pragma unroll
+                for (int c = 0; c < ncols_dst; ++c) {
+                    const simd<uint32_t, lanes> abc = ab + c * col_bytes;
+                    const simd<float, lanes> ad = simd<float, lanes>(gather<sycl::half, lanes, 1>(
+                        reinterpret_cast<const sycl::half *>(input), abc, valid, zero_half));
+                    simd<int, lanes * 8> input_words = gather<int, lanes * 8, 8>(
+                        reinterpret_cast<const int *>(input), abc + 4, valid, simd<int, lanes * 8>(0));
+#pragma unroll
+                    for (int r = 0; r < rows_per_thread; ++r) {
+                        simd<int, lanes> sum = 0;
+#pragma unroll
+                        for (int j = 0; j < 8; ++j) {
+                            const simd<int, lanes> wj = w[r].template select<lanes, 1>(j * lanes);
+                            const simd<int, lanes> aj = input_words.select<lanes, 1>(j * lanes);
+                            sum = dp4a<int>(sum, wj, aj);
+                        }
+                        acc[c][r] += wd[r] * ad * simd<float, lanes>(sum);
+                    }
+                }
+            }
+#pragma unroll
+            for (int c = 0; c < ncols_dst; ++c) {
+#pragma unroll
+                for (int r = 0; r < rows_per_thread; ++r) {
+                    if (row0 + r < nrows) {
+                        dst[c * stride_col_dst + row0 + r] = reduce<float>(acc[c][r], std::plus<>{});
+                    }
+                }
+            }
+        });
+}
 #endif
 
 static void mul_mat_vec_pq2_0_q8_1_sycl(const void * vx, const void * vy,
@@ -1535,7 +1641,13 @@ static void mul_mat_vec_pq2_0_q8_1_sycl(const void * vx, const void * vy,
     GGML_ASSERT(ncols % QK_PQ2_0 == 0);
 #ifdef GGML_SYCL_MMVQ_HAS_ESIMD
     if (g_ggml_sycl_enable_esimd) {
-        mul_mat_vec_pq2_0_q8_1_esimd(vx, vy, dst, ncols, nrows, stream);
+        static const int single_rows = ggml_sycl_get_env("GGML_SYCL_PQ2_SINGLE_ROWS", 2);
+        switch (single_rows) {
+            case 1:  mul_mat_vec_pq2_0_q8_1_esimd_ncols<1, 1>(vx, vy, dst, ncols, nrows, 0, 0, stream); break;
+            case 2:  mul_mat_vec_pq2_0_q8_1_esimd_ncols<1, 2>(vx, vy, dst, ncols, nrows, 0, 0, stream); break;
+            case 4:  mul_mat_vec_pq2_0_q8_1_esimd_ncols<1, 4>(vx, vy, dst, ncols, nrows, 0, 0, stream); break;
+            default: mul_mat_vec_pq2_0_q8_1_esimd(vx, vy, dst, ncols, nrows, stream); break;
+        }
         return;
     }
 #endif
@@ -1561,6 +1673,18 @@ static void mul_mat_vec_pq2_0_q8_1_sycl_ncols(
         const int stride_col_y, const int stride_col_dst,
         dpct::queue_ptr stream) {
     GGML_ASSERT(ncols % QK_PQ2_0 == 0);
+#ifdef GGML_SYCL_MMVQ_HAS_ESIMD
+    if (g_ggml_sycl_enable_esimd) {
+        static const int rows_per_thread = ggml_sycl_get_env("GGML_SYCL_PQ2_NCOLS_ROWS", 4);
+        switch (rows_per_thread) {
+            case 1:  mul_mat_vec_pq2_0_q8_1_esimd_ncols<ncols_dst, 1>(vx, vy, dst, ncols, nrows, stride_col_y, stride_col_dst, stream); break;
+            case 2:  mul_mat_vec_pq2_0_q8_1_esimd_ncols<ncols_dst, 2>(vx, vy, dst, ncols, nrows, stride_col_y, stride_col_dst, stream); break;
+            case 8:   mul_mat_vec_pq2_0_q8_1_esimd_ncols<ncols_dst, 8>(vx, vy, dst, ncols, nrows, stride_col_y, stride_col_dst, stream); break;
+            default: mul_mat_vec_pq2_0_q8_1_esimd_ncols<ncols_dst, 4>(vx, vy, dst, ncols, nrows, stride_col_y, stride_col_dst, stream); break;
+        }
+        return;
+    }
+#endif
     const int block_num_y = (nrows + GGML_SYCL_MMV_Y - 1) / GGML_SYCL_MMV_Y;
     const sycl::range<3> block_nums(1, 1, block_num_y);
     const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, WARP_SIZE);
