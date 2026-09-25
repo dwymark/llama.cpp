@@ -5693,7 +5693,7 @@ struct node_profile {
         if (!f) return;
         std::vector<std::pair<std::string, row>> v(rows.begin(), rows.end());
         std::sort(v.begin(), v.end(), [](auto & a, auto & b) { return a.second.ms > b.second.ms; });
-        fprintf(f, "node_profile: %ld single-token graphs, device span %.3f ms/graph, host wall %.3f ms/graph\n", graphs, total_ms / graphs, wall_ms / graphs);
+        fprintf(f, "node_profile: %ld profiled graphs, device span %.3f ms/graph, host wall %.3f ms/graph\n", graphs, total_ms / graphs, wall_ms / graphs);
         for (auto & [k, r] : v) {
             fprintf(f, "node_profile: %9.3f ms/graph %8.3f idle %6.1f calls/graph  %s\n", r.ms / graphs, r.idle_ms / graphs, (double) r.n / graphs, k.c_str());
         }
@@ -5723,7 +5723,11 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
     bool single_token = false;
     for (int k = 0; k < cgraph->n_nodes; k++) {
         const ggml_tensor * t = cgraph->nodes[k];
-        if (t->op == GGML_OP_MUL_MAT && ggml_is_quantized(t->src[0]->type)) { single_token = t->src[1]->ne[1] == 1; break; }
+        if (t->op == GGML_OP_MUL_MAT && ggml_is_quantized(t->src[0]->type)) {
+            static const int prof_n = ggml_sycl_get_env("GGML_SYCL_NODE_PROFILE_N", 1);
+            single_token = prof_n == 1 ? t->src[1]->ne[1] == 1 : t->src[1]->ne[1] >= prof_n;
+            break;
+        }
     }
     static const int profile_mode = ggml_sycl_get_env("GGML_SYCL_NODE_PROFILE", 0);
     const bool prof_on = profile_mode == 1 && single_token;
@@ -5863,7 +5867,8 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
         g_node_profile.graphs++;
         g_node_profile.total_ms += (prev - first) * 1e-6;
         g_node_profile.wall_ms += host_ms;
-        if (g_node_profile.graphs == 32) {
+        static const int prof_every = ggml_sycl_get_env("GGML_SYCL_NODE_PROFILE_EVERY", 32);
+        if (g_node_profile.graphs == prof_every) {
             g_node_profile.dump();
         }
     }
