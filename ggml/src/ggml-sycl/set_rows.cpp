@@ -307,8 +307,55 @@ static void set_rows_sycl(
     );
 }
 
+// Same-type rows with 16-byte alignment copy as 16-byte vectors, one work-item per vector, with the row
+// decomposition done once per vector. The recurrent-state snapshots written for speculative rollback are
+// multi-megabyte rows of this kind.
+template<typename TIdx>
+static bool set_rows_sycl_same_type_vec(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, queue_ptr stream) {
+    GGML_TENSOR_BINARY_OP_LOCALS
+    const size_t ts = ggml_type_size(src0->type);
+    if (src0->type != dst->type || ggml_is_quantized(src0->type) || nb00 != ts || nb0 != ts) {
+        return false;
+    }
+    const size_t row_bytes = ne00 * ts;
+    const uintptr_t align = reinterpret_cast<uintptr_t>(src0->data) | reinterpret_cast<uintptr_t>(dst->data) |
+                            row_bytes | nb01 | nb02 | nb03 | nb1 | nb2 | nb3;
+    if (align % 16 != 0) {
+        return false;
+    }
+    const int64_t nvec = row_bytes / 16;
+    const int64_t nrows = ne01 * ne02 * ne03;
+    if (nvec > INT32_MAX || nrows > INT32_MAX) {
+        return false;
+    }
+    const char * src0_d = (const char *) src0->data;
+    const char * src1_d = (const char *) src1->data;
+    char * dst_d = (char *) dst->data;
+    constexpr int block_size = 256;
+    const int64_t total = nvec * nrows;
+    stream->parallel_for(sycl::nd_range<1>(ceil_div(total, block_size) * block_size, block_size), [=](sycl::nd_item<1> item) {
+        const int64_t i = item.get_global_linear_id();
+        if (i >= total) {
+            return;
+        }
+        const int32_t r = static_cast<int32_t>(i / nvec);
+        const int64_t v = i - static_cast<int64_t>(r) * nvec;
+        const int32_t i01 = r % static_cast<int32_t>(ne01);
+        const int32_t i02 = (r / static_cast<int32_t>(ne01)) % static_cast<int32_t>(ne02);
+        const int32_t i03 = r / static_cast<int32_t>(ne01 * ne02);
+        const int64_t dst_row = *reinterpret_cast<const TIdx *>(src1_d + i01 * nb10 + (i02 % ne11) * nb11 + (i03 % ne12) * nb12);
+        const sycl::uint4 * s = reinterpret_cast<const sycl::uint4 *>(src0_d + i01 * nb01 + i02 * nb02 + i03 * nb03);
+        sycl::uint4 * d = reinterpret_cast<sycl::uint4 *>(dst_d + dst_row * nb1 + i02 * nb2 + i03 * nb3);
+        d[v] = s[v];
+    });
+    return true;
+}
+
 template<typename TIn, typename TIdx>
 static void set_rows_sycl(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    if (set_rows_sycl_same_type_vec<TIdx>(src0, src1, dst, ctx.stream())) {
+        return;
+    }
     const char * src0_d = (const char *)src0->data;
     const TIdx * src1_d = (const TIdx *)src1->data;
 
