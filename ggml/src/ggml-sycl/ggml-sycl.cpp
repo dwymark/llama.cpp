@@ -66,6 +66,7 @@
 #include "ggml-sycl/quantize.hpp"
 #include "ggml-sycl/repeat_back.hpp"
 #include "ggml-sycl/set_rows.hpp"
+#include "ggml-sycl/pq2-xmx.hpp"
 #include "ggml-sycl/set.hpp"
 #include "ggml-sycl/dsv4-hc.hpp"
 #include "ggml-sycl/lightning-indexer.hpp"
@@ -83,6 +84,7 @@
 #include "ggml-sycl/gated_delta_net.hpp"
 #include "ggml-sycl/pool.hpp"
 #include "ggml-sycl/cross_entropy_loss.hpp"
+#include "ggml-sycl/pq2-xmx.hpp"
 
 #define MEM_SIZE_2M	0x00200000
 #define MEM_SIZE_1G	0x40000000
@@ -2710,6 +2712,15 @@ inline void ggml_sycl_op_mul_mat_sycl(
         return;
     }
 #endif
+
+    static const int pq2_xmx = ggml_sycl_get_env("GGML_SYCL_PQ2_XMX", 0);
+    if (src0->type == GGML_TYPE_PQ2_0 && pq2_xmx && src1_ncols >= 16 && ggml_is_contiguous(src0) &&
+        row_diff == src0->ne[1] &&
+        ggml_sycl_pq2_xmx_mul_mat(ctx, src0_dd_i, src1_ddf_i, dst_dd_i, row_diff, ne10, src1_ncols, ldc, stream)) {
+        GGML_UNUSED(src1_ddq_i);
+        GGML_UNUSED(src1_padded_row_size);
+        return;
+    }
 
     if ((src0->type == GGML_TYPE_F16 || ggml_is_quantized(src0->type)) && use_fp16 && ggml_is_contiguous(src0) &&
         row_diff == src0->ne[1] && dst->op_params[0] == GGML_PREC_DEFAULT) {
