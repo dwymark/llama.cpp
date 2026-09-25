@@ -259,6 +259,31 @@ static void convert_mul_mat_vec_bf16_sycl(const void *vx, const dfloat *y,
 }
 #endif
 
+#ifdef GGML_SYCL_DMMV_HAS_BF16
+// Few long rows, such as the delta-net gate projections (48 rows of 5120), leave the row-per-sub-group kernel
+// with too few sub-groups to hide load latency. One work-group per row spreads the row over 256 work-items.
+static void mul_mat_vec_bf16_wide_rows_sycl(const void * vx, const dfloat * y, float * dst, const int ncols,
+                                            const int nrows, dpct::queue_ptr stream) {
+    constexpr int wg = 256;
+    stream->parallel_for(sycl::nd_range<1>(static_cast<size_t>(nrows) * wg, wg),
+        [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+            const int row = item.get_group(0);
+            const int tid = item.get_local_id(0);
+            const sycl::ext::oneapi::bfloat16 * x =
+                static_cast<const sycl::ext::oneapi::bfloat16 *>(vx) + static_cast<int64_t>(row) * ncols;
+            float sum = 0.0f;
+            for (int c = 2 * tid; c < ncols; c += 2 * wg) {
+                sum += static_cast<float>(x[c]) * static_cast<float>(y[c]) +
+                       static_cast<float>(x[c + 1]) * static_cast<float>(y[c + 1]);
+            }
+            sum = sycl::reduce_over_group(item.get_group(), sum, sycl::plus<float>());
+            if (tid == 0) {
+                dst[row] = sum;
+            }
+        });
+}
+#endif
+
 static void dequantize_mul_mat_vec_q2_k(const void *__restrict__ vx,
                                         const float *__restrict__ yy,
                                         float *__restrict__ dst,
@@ -2210,7 +2235,11 @@ void ggml_sycl_op_dequantize_mul_mat_vec(
             break;
 #ifdef GGML_SYCL_DMMV_HAS_BF16
         case GGML_TYPE_BF16:
-            convert_mul_mat_vec_bf16_sycl(src0_dd_i, src1_dfloat, dst_dd_i, ne00, row_diff, stream);
+            if (row_diff <= 512) {
+                mul_mat_vec_bf16_wide_rows_sycl(src0_dd_i, src1_dfloat, dst_dd_i, ne00, row_diff, stream);
+            } else {
+                convert_mul_mat_vec_bf16_sycl(src0_dd_i, src1_dfloat, dst_dd_i, ne00, row_diff, stream);
+            }
             break;
 #endif
         default:
