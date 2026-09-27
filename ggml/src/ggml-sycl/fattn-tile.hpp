@@ -723,19 +723,17 @@ static void flash_attn_tile(const char *  Q,
 
     const int col_Q_0 = item_ct1.get_group(2) * ncols1;  // Index of the first Q column for this SYCL block to work on.
 
-    // Each work-group covers ncols2 Q heads of one K/V head. When ncols2 does not divide the GQA ratio, the last
-    // tile of each K/V head is padded: its extra columns load zeros and are never written.
-    const int gqa_ratio    = ne02 / ne12; // With grouped query attention there are > 1 Q matrices per K, V matrix.
-    const int ntiles_z_gqa = (gqa_ratio + ncols2 - 1) / ncols2;
-    const int sequence     = item_ct1.get_group(0) / (ntiles_z_gqa * ne12);
-    const int z_KV         = (item_ct1.get_group(0) / ntiles_z_gqa) % ne12;
-    const int zt_gqa       = item_ct1.get_group(0) % ntiles_z_gqa;
-    const int head0        = z_KV * gqa_ratio + zt_gqa * ncols2;
-    const int ncols2_valid = sycl::min(ncols2, gqa_ratio - zt_gqa * ncols2);
-    const float * Q_f  = (const float *) (Q + nb03*sequence + nb02* head0);
-    const sycl::half2 * K_h2      = (const sycl::half2 *) (K + nb13 * sequence + nb12 * z_KV);
-    const sycl::half2 * V_h2 =
-        (const sycl::half2 *) (V + nb23 * sequence + nb22 * z_KV);  // K and V have same shape
+    // A work-group covers ncols2 Q heads of one K/V head; padded columns load zeros and are not written.
+    const int     gqa_ratio    = ne02 / ne12;  // With grouped query attention there are > 1 Q matrices per K, V matrix.
+    const int     ntiles_z_gqa = (gqa_ratio + ncols2 - 1) / ncols2;
+    const int     sequence     = item_ct1.get_group(0) / (ntiles_z_gqa * ne12);
+    const int     z_KV         = (item_ct1.get_group(0) / ntiles_z_gqa) % ne12;
+    const int     zt_gqa       = item_ct1.get_group(0) % ntiles_z_gqa;
+    const int     head0        = z_KV * gqa_ratio + zt_gqa * ncols2;
+    const int     ncols2_valid = sycl::min(ncols2, gqa_ratio - zt_gqa * ncols2);
+    const float * Q_f          = (const float *) (Q + nb03 * sequence + nb02 * head0);
+    const sycl::half2 * K_h2   = (const sycl::half2 *) (K + nb13 * sequence + nb12 * z_KV);
+    const sycl::half2 * V_h2   = (const sycl::half2 *) (V + nb23 * sequence + nb22 * z_KV);  // K and V have same shape
 
     const sycl::half * maskh = mask ? (const sycl::half *) (mask + nb33 * (sequence % ne33)) : nullptr;
 
@@ -831,9 +829,10 @@ static void flash_attn_tile(const char *  Q,
                 __dpct_align__(16) float tmp_f[cpy_ne_D] = { 0.0f };
                 if (c < ncols2_valid) {
                     ggml_sycl_memcpy_1<sizeof(tmp_f)>(
-                        tmp_f, &Q_f[c * (nb02 / sizeof(float)) + fastmodulo(col_Q_0 + j, ne01) * (nb01 / sizeof(float)) +
-                                    i0 + (item_ct1.get_local_id(1) % np) * (warp_size * cpy_ne_D) +
-                                    item_ct1.get_local_id(2) * cpy_ne_D]);
+                        tmp_f,
+                        &Q_f[c * (nb02 / sizeof(float)) + fastmodulo(col_Q_0 + j, ne01) * (nb01 / sizeof(float)) + i0 +
+                             (item_ct1.get_local_id(1) % np) * (warp_size * cpy_ne_D) +
+                             item_ct1.get_local_id(2) * cpy_ne_D]);
                 }
 
 #pragma unroll
