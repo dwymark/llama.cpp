@@ -1204,7 +1204,7 @@ static void launch_fattn_tile_switch_ncols2(ggml_backend_sycl_context & ctx, ggm
     }
 
     if constexpr (DV <= 256) {
-        // Ratios 5 to 7 use one padded tile of eight for up to two Q columns so each K/V head is read once.
+        // Pad ratios 5 to 7 to eight Q heads so each K/V head is read once; above two Q columns this needs the 32-column tile.
         if (use_gqa_opt && (gqa_ratio % 8 == 0 || (gqa_ratio > 4 && gqa_ratio < 8 && Q->ne[1] <= 2))) {
             launch_fattn_tile_switch_ncols1<DKQ, DV, 8, use_logit_softcap>(ctx, dst);
             return;
