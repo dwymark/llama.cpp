@@ -11517,7 +11517,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {16, 1}, 49152, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true,  2048));
     // qwen3.5-27b full-attn layers: head_count_kv=4, 24 query heads (gqa_ratio=6)
     for (int nb : {1, 4}) {
-        for (int kv : {8192, 16384}) {
+        for (int kv : {512, 2048, 8192, 16384}) {
             test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
         }
     }
