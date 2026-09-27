@@ -828,10 +828,12 @@ static void flash_attn_tile(const char *  Q,
                 i0 + (item_ct1.get_local_id(1) % np) * (warp_size * cpy_ne_D) + item_ct1.get_local_id(2) * cpy_ne_D <
                     DKQ) {
                 __dpct_align__(16) float tmp_f[cpy_ne_D] = { 0.0f };
-                if (c < ncols2_valid) ggml_sycl_memcpy_1<sizeof(tmp_f)>(
-                    tmp_f, &Q_f[c * (nb02 / sizeof(float)) + fastmodulo(col_Q_0 + j, ne01) * (nb01 / sizeof(float)) +
-                                i0 + (item_ct1.get_local_id(1) % np) * (warp_size * cpy_ne_D) +
-                                item_ct1.get_local_id(2) * cpy_ne_D]);
+                if (c < ncols2_valid) {
+                    ggml_sycl_memcpy_1<sizeof(tmp_f)>(
+                        tmp_f, &Q_f[c * (nb02 / sizeof(float)) + fastmodulo(col_Q_0 + j, ne01) * (nb01 / sizeof(float)) +
+                                    i0 + (item_ct1.get_local_id(1) % np) * (warp_size * cpy_ne_D) +
+                                    item_ct1.get_local_id(2) * cpy_ne_D]);
+                }
 
 #pragma unroll
                 for (int i1 = 0; i1 < cpy_ne_D; ++i1) {
