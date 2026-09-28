@@ -7,7 +7,7 @@
 #include <cmath>
 #include <float.h>
 
-// daily pads GQA ratios 5 and 7 up to four Q columns; see launch_fattn_tile_switch_ncols2.
+// daily pads GQA ratios 5 and 7 up to four Q columns, and ratio 6 from 16k of context; see launch_fattn_tile_switch_ncols2.
 #define GGML_SYCL_FA_GQA_PAD_4
 
 namespace syclex = sycl::ext::oneapi::experimental;
@@ -1206,9 +1206,11 @@ static void launch_fattn_tile_switch_ncols2(ggml_backend_sycl_context & ctx, ggm
     if constexpr (DV <= 256) {
         // Pad ratios 5 to 7 to eight Q heads so each K/V head is read once; above two Q columns this needs the 32-column tile.
         // That tile still wins at three or four Q columns for ratios 5 and 7, whose unpadded tiles read each K/V head 5 or 7
-        // times, but loses for ratio 6, which reads it 3 times; GGML_SYCL_FA_GQA_PAD_4 extends ratios 5 and 7 to four columns.
+        // times; for ratio 6, which reads it 3 times, it loses at short context and wins at long context inside llama-server
+        // (0.80x at 4k, even at 16k, 1.09x at 64k). GGML_SYCL_FA_GQA_PAD_4 extends ratios 5 and 7 to four columns, and
+        // ratio 6 from 16k of context.
 #ifdef GGML_SYCL_FA_GQA_PAD_4
-        const int gqa_pad_max_cols = gqa_ratio % 2 != 0 ? 4 : 2;
+        const int gqa_pad_max_cols = gqa_ratio % 2 != 0 || K->ne[1] >= 16384 ? 4 : 2;
 #else
         const int gqa_pad_max_cols = 2;
 #endif // GGML_SYCL_FA_GQA_PAD_4
