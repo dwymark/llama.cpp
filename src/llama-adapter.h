@@ -4,6 +4,7 @@
 
 #include "ggml-cpp.h"
 
+#include <map>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -18,6 +19,27 @@ struct llama_adapter_cvec {
     ggml_tensor * tensor_for(int il) const;
 
     ggml_tensor * apply_to(ggml_context * ctx, ggml_tensor * cur, int  il) const;
+
+    // steering mode, entered by steer_configure: per-layer flags choose which layers add the
+    // direction (scaled per token by `scale`, F32 [1, n_tokens]), read the projection onto the
+    // layer's unit direction, and cap it from below; projections read are appended to `readout`
+    ggml_tensor * apply_steer(ggml_context * ctx, ggml_tensor * cur, int il, ggml_tensor * scale,
+                              std::vector<std::pair<int, ggml_tensor *>> & readout) const;
+
+    bool steer_configure(const llama_model & model, const float * unit, const uint8_t * flags, int32_t n_layer);
+    void steer_set_tau(const float * tau, int32_t n_layer);
+
+    bool steering() const { return !steer_flags.empty(); }
+    float scale_for(llama_seq_id seq_id) const;
+
+    // bumped by every steer_configure; graph reuse requires it to match
+    uint32_t version = 0;
+
+    float scale_default = 1.0f;
+    std::map<llama_seq_id, float> seq_scale;
+
+    std::vector<uint8_t> steer_flags; // per layer, empty outside steering mode
+    std::vector<int>     read_layers; // layers with STEER_READ, ascending
 
     bool apply(
             const llama_model & model,
@@ -37,6 +59,8 @@ private:
     std::vector<ggml_backend_buffer_ptr> bufs;
 
     std::vector<ggml_tensor *> tensors; // per layer
+    std::vector<ggml_tensor *> units;   // per layer, unit directions for reading and capping
+    std::vector<ggml_tensor *> taus;    // per layer, F32 [1] capping thresholds
 };
 
 using llama_adapter_cvec_ptr = std::shared_ptr<llama_adapter_cvec>;

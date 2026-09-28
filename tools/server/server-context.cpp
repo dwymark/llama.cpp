@@ -237,6 +237,26 @@ struct server_slot {
 
     std::vector<completion_token_output> generated_token_probs;
 
+    // steering state for this request; the trigger is a one-sided cumulative sum on one read layer's
+    // projection that switches the scale to `on` for `hold` tokens (for good if hold <= 0) when it exceeds h
+    struct steer_state {
+        bool  active    = false;
+        bool  trigger   = false;
+        int   trig_idx  = -1; // position of the trigger layer among the read layers
+        float mu = 0.0f, k = 0.0f, h = 0.0f, on = 0.0f, off = 0.0f;
+        int   hold      = 0;
+        int   hold_left = 0;
+        int   fired     = 0;
+        bool  diff      = false;
+        float prev      = NAN;
+        float sum       = 0.0f;
+        float scale     = 0.0f;
+        bool  record    = false;         // read every prompt token too
+        json  prompt_readout = json::array();
+        json  readout   = json::array(); // per decoded token of this slot, the projections read
+        std::vector<float> scales;       // the scale in force after each generated token
+    } steer;
+
     bool has_next_token = true;
     bool has_new_line   = false;
     bool truncated      = false;
@@ -340,6 +360,7 @@ struct server_slot {
         }
         generated_tokens.clear();
         generated_token_probs.clear();
+        steer = {};
         json_schema = json();
 
         task_prev = std::move(task);
@@ -846,6 +867,10 @@ private:
     common_context_seq_rm_type ctx_dft_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
 
     common_speculative_ptr spec;
+
+    // steering configuration the context carries: the request's steer field without its per-slot parts
+    std::string steer_key;
+    std::map<std::string, common_control_vector_data> steer_vectors; // loaded files by name
 
     bool add_bos_token = true;
 
@@ -1611,6 +1636,210 @@ private:
         return output;
     }
 
+    // Applies a request's steering. Vectors are named, never given by path, and load from STEER_DIR.
+    // Everything but scale and trigger is shared by the whole context, so a request whose
+    // configuration differs from the one in force is refused while another slot is busy.
+    // Read and capped layers use the unit direction of the file's next layer, since
+    // llama-cvector-generator stores the difference at layer K's output as direction.K+1.
+    bool steer_launch(server_slot & slot, const json & st, std::string & err) {
+        slot.steer = {};
+        json shared = st.is_object() ? st : json();
+        if (shared.is_object()) {
+            shared.erase("scale");
+            shared.erase("trigger");
+            shared.erase("read_prompt");
+        }
+        const std::string key = shared.is_null() ? "" : shared.dump();
+
+        if (key != steer_key) {
+            for (const auto & other : slots) {
+                if (other.id != slot.id && other.is_processing()) {
+                    err = "another slot is running with a different steering configuration";
+                    return false;
+                }
+            }
+            if (key.empty()) {
+                llama_set_adapter_cvec(ctx_tgt, nullptr, 0, 0, 0, 0);
+                llama_steer_configure(ctx_tgt, nullptr, nullptr, 0);
+                steer_key.clear();
+            } else if (!steer_configure(shared, err)) {
+                return false;
+            } else {
+                steer_key = key;
+            }
+        }
+        if (key.empty()) {
+            return true;
+        }
+        if (slot.can_speculate()) {
+            err = "steering does not support speculative decoding";
+            return false;
+        }
+
+        auto & s = slot.steer;
+        s.active = true;
+        s.scale  = json_value(st, "scale", 0.0f);
+        if (st.contains("trigger")) {
+            const json & t = st.at("trigger");
+            const int layer = t.at("layer").get<int>();
+            const auto read = json_value(st, "read", std::vector<int>());
+            std::vector<int> sorted(read);
+            std::sort(sorted.begin(), sorted.end());
+            auto it = std::find(sorted.begin(), sorted.end(), layer);
+            if (it == sorted.end()) {
+                err = "the trigger layer must be read";
+                return false;
+            }
+            s.trigger  = true;
+            s.trig_idx = it - sorted.begin();
+            s.mu   = json_value(t, "mu", 0.0f);
+            s.k    = json_value(t, "k", 0.0f);
+            s.h    = t.at("h").get<float>();
+            s.on   = t.at("on").get<float>();
+            s.off  = json_value(t, "off", s.scale);
+            s.hold = json_value(t, "hold", 0);
+            s.diff = json_value(t, "diff", false);
+            s.scale = s.off;
+        }
+        llama_steer_set_scale(ctx_tgt, slot.id, s.scale);
+        s.record = json_value(st, "read_prompt", false);
+        llama_steer_record(ctx_tgt, slot.id, s.record);
+        return true;
+    }
+
+    bool steer_configure(const json & st, std::string & err) {
+        const char * dir = std::getenv("STEER_DIR");
+        if (dir == nullptr) {
+            err = "the server was started without STEER_DIR";
+            return false;
+        }
+        const std::string name = json_value(st, "vector", std::string());
+        if (name.empty() || name.find("..") != std::string::npos ||
+                name.find_first_not_of("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-") != std::string::npos) {
+            err = "vector must be a plain name";
+            return false;
+        }
+        if (!steer_vectors.count(name)) {
+            auto v = common_control_vector_load({{1.0f, std::string(dir) + "/" + name + ".gguf"}});
+            if (v.n_embd == -1) {
+                err = "cannot load vector " + name;
+                return false;
+            }
+            steer_vectors[name] = std::move(v);
+        }
+        const auto & v = steer_vectors[name];
+        const int n_layer = llama_model_n_layer(model_tgt);
+        const int n_embd  = llama_model_n_embd(model_tgt);
+        if (v.n_embd != n_embd) {
+            err = "vector does not match the model's width";
+            return false;
+        }
+        const int n_file = v.data.size() / n_embd; // file layers 1..n_file
+
+        std::vector<uint8_t> flags(n_layer, 0);
+        auto band = [&](const json & b, uint8_t f) {
+            const int lo = b.at(0).get<int>(), hi = b.at(1).get<int>();
+            for (int il = std::max(1, lo); il <= std::min(n_layer - 1, hi); il++) {
+                flags[il] |= f;
+            }
+        };
+        if (st.contains("add")) {
+            band(st.at("add"), LLAMA_STEER_ADD);
+        }
+        for (int il : json_value(st, "read", std::vector<int>())) {
+            if (il < 1 || il >= n_layer) {
+                err = "read layer out of range";
+                return false;
+            }
+            flags[il] |= LLAMA_STEER_READ;
+        }
+        std::vector<float> tau(n_layer, 0.0f);
+        if (st.contains("cap")) {
+            const json & c = st.at("cap");
+            band(c.at("layers"), LLAMA_STEER_CAP);
+            const json & t = c.at("tau");
+            for (int il = 1; il < n_layer; il++) {
+                if (t.is_number()) {
+                    tau[il] = t.get<float>();
+                } else if (t.contains(std::to_string(il))) {
+                    tau[il] = t.at(std::to_string(il)).get<float>();
+                } else if (flags[il] & LLAMA_STEER_CAP) {
+                    err = "no tau for capped layer " + std::to_string(il);
+                    return false;
+                }
+            }
+        }
+
+        std::vector<float> unit((size_t) n_embd * n_layer, 0.0f);
+        for (int il = 1; il < n_layer; il++) {
+            if (!(flags[il] & (LLAMA_STEER_READ | LLAMA_STEER_CAP))) {
+                continue;
+            }
+            const int src = std::min(il + 1, n_file);
+            const float * d = v.data.data() + (size_t) n_embd * (src - 1);
+            double norm = 0.0;
+            for (int i = 0; i < n_embd; i++) {
+                norm += (double) d[i] * d[i];
+            }
+            norm = std::sqrt(norm);
+            for (int i = 0; i < n_embd; i++) {
+                unit[(size_t) n_embd * il + i] = norm > 0 ? d[i] / norm : 0.0f;
+            }
+        }
+
+        if (llama_set_adapter_cvec(ctx_tgt, v.data.data(), v.data.size(), n_embd, 1, n_layer - 1) != 0 ||
+                llama_steer_configure(ctx_tgt, unit.data(), flags.data(), n_layer) != 0) {
+            err = "cannot apply the configuration";
+            return false;
+        }
+        llama_steer_set_tau(ctx_tgt, tau.data(), n_layer);
+        llama_steer_set_scale(ctx_tgt, -1, 0.0f);
+        SRV_INF("steering with %s: %s\n", name.c_str(), st.dump().c_str());
+        return true;
+    }
+
+    // records the projections read for the slot's latest token and advances its trigger
+    void steer_after_token(server_slot & slot) {
+        auto & s = slot.steer;
+        float buf[256];
+        const int n = llama_steer_get_readout(ctx_tgt, slot.id, buf, 256);
+        if (s.record) {
+            // the first sampled token closes the prompt: its record holds every prompt token's projections
+            std::vector<float> rec(llama_steer_take_record(ctx_tgt, slot.id, nullptr, 0));
+            const int64_t n_rec = llama_steer_take_record(ctx_tgt, slot.id, rec.data(), rec.size());
+            for (int64_t i = 0; n > 0 && i + n <= n_rec; i += n) {
+                s.prompt_readout.push_back(std::vector<float>(rec.begin() + i, rec.begin() + i + n));
+            }
+            s.record = false;
+        }
+        if (n > 0) {
+            s.readout.push_back(std::vector<float>(buf, buf + n));
+        }
+        if (s.trigger && n > s.trig_idx) {
+            float x = buf[s.trig_idx];
+            if (s.diff) {
+                const float dx = std::isnan(s.prev) ? 0.0f : x - s.prev;
+                s.prev = x;
+                x = dx;
+            }
+            if (s.hold_left > 0) {
+                if (--s.hold_left == 0) {
+                    s.scale = s.off;
+                    s.sum   = 0.0f;
+                }
+            } else if (s.scale == s.off) {
+                s.sum = std::max(0.0f, s.sum + x - s.mu - s.k);
+                if (s.sum > s.h) {
+                    s.fired++;
+                    s.scale     = s.on;
+                    s.hold_left = s.hold;
+                }
+            }
+            llama_steer_set_scale(ctx_tgt, slot.id, s.scale);
+        }
+        s.scales.push_back(s.scale);
+    }
+
     bool launch_slot_with_task(server_slot & slot, server_task && task) {
         // process per-request lora adapters
         if (!task.params.lora.empty()) {
@@ -1712,6 +1941,14 @@ private:
             SLT_TRC(slot, "sampler params: \n%s\n", task.params.sampling.print().c_str());
         } else {
             slot.smpl.reset();
+        }
+
+        {
+            std::string err;
+            if (!steer_launch(slot, task.params.steer, err)) {
+                send_error(task, "steer: " + err, ERROR_TYPE_INVALID_REQUEST);
+                return false;
+            }
         }
 
         // the per-request limit takes priority over the global one
@@ -1993,6 +2230,15 @@ private:
         res->id_slot = slot.id;
 
         res->index = slot.task->index;
+
+        if (slot.steer.active) {
+            res->steer_out = {
+                {"prompt_readout", slot.steer.prompt_readout},
+                {"readout", slot.steer.readout},
+                {"scale",   slot.steer.scales},
+                {"fired",   slot.steer.fired},
+            };
+        }
 
         // keep copy of last generated text for debugging purposes
         if (slots_debug) {
@@ -3743,6 +3989,10 @@ private:
             slot.i_batch = -1;
 
             common_sampler_accept(slot.smpl.get(), id, true);
+
+            if (slot.steer.active) {
+                steer_after_token(slot);
+            }
 
             // here we have synchronized the llama_context (due to the sampling above), so we can do time measurement
             const int64_t t_now = ggml_time_us();

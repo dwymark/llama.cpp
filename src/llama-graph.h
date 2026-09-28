@@ -215,6 +215,21 @@ public:
     const int64_t n_embd = 0;
 };
 
+// per-token steering scale, taken from each token's sequence
+class llm_graph_input_steer : public llm_graph_input_i {
+public:
+    llm_graph_input_steer(const llama_adapter_cvec * cvec) : cvec(cvec) {}
+    virtual ~llm_graph_input_steer() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    bool can_reuse(const llm_graph_params & params) override;
+
+    ggml_tensor * scale = nullptr; // F32 [1, n_tokens]
+
+    const llama_adapter_cvec * cvec;
+};
+
 class llm_graph_input_pos : public llm_graph_input_i {
 public:
     llm_graph_input_pos(uint32_t n_pos_per_embd) : n_pos_per_embd(n_pos_per_embd) {}
@@ -887,6 +902,8 @@ struct llm_graph_params {
 
     llm_graph_result * res;
 
+    uint32_t cvec_version = 0;
+
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
     bool allow_reuse(const llm_graph_params & other) const {
@@ -966,6 +983,7 @@ struct llm_graph_params {
             arch  == other.arch  &&
             gtype == other.gtype &&
             cvec  == other.cvec  &&
+            cvec_version == other.cvec_version &&
             loras == other.loras &&
             cross == other.cross;
     }
@@ -1032,6 +1050,9 @@ public:
     ggml_tensor * t_h_nextn     = nullptr; // [n_embd, n_outputs] hidden state before final output norm
 
     std::vector<ggml_tensor *> t_layer_inp;
+
+    ggml_tensor * t_steer_scale = nullptr;
+    std::vector<std::pair<int, ggml_tensor *>> t_readout; // (layer, F32 [1, n_tokens] projection)
 
     std::vector<ggml_tensor *> t_sampled;
     std::vector<ggml_tensor *> t_dspark_greedy;

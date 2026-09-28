@@ -236,6 +236,14 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
             ctx.params.lora = parse_lora_request(lora);
         }));
 
+    add((new field_json("steer"))
+        ->set_desc("Steer this request with a named control vector from the directory in STEER_DIR: "
+                   "{vector, scale, add: [first, last], read: [layers], cap: {layers: [first, last], tau: number or {layer: number}}, "
+                   "trigger: {layer, mu, k, h, on, off, hold, diff}}")
+        ->set_handler([&](field_eval_context & ctx, const json & data) {
+            ctx.params.steer = data.at("steer");
+        }));
+
     // sequence breakers for DRY
     // Currently, this is not compatible with TextGen WebUI, Koboldcpp and SillyTavern format
     // Ref: https://github.com/oobabooga/text-generation-webui/blob/d1af7a41ade7bd3c3a463bfa640725edb818ebaf/extensions/openai/typing.py#L39

@@ -736,6 +736,49 @@ extern "C" {
                          int32_t   il_start,
                          int32_t   il_end);
 
+    // Steering beyond a constant control vector. After llama_set_adapter_cvec loads per-layer
+    // directions, llama_steer_configure takes per-layer flags (1 add the direction, 2 read the
+    // projection onto the unit direction, 4 cap that projection from below at tau) and unit
+    // directions, both for all n_layer layers from layer 0; NULL flags return to plain control
+    // vectors. In steering mode the layer range given to llama_set_adapter_cvec is ignored.
+    // Projections are read before the layer's own steering is applied.
+    enum llama_steer_flag {
+        LLAMA_STEER_ADD  = 1,
+        LLAMA_STEER_READ = 2,
+        LLAMA_STEER_CAP  = 4,
+    };
+
+    LLAMA_API int32_t llama_steer_configure(
+            struct llama_context * ctx,
+                     const float * unit,
+                   const uint8_t * flags,
+                         int32_t   n_layer);
+
+    // capping thresholds, one per layer from layer 0
+    LLAMA_API void llama_steer_set_tau(struct llama_context * ctx, const float * tau, int32_t n_layer);
+
+    // the factor on the added direction for a sequence's tokens; seq_id < 0 sets the default for all
+    LLAMA_API void llama_steer_set_scale(struct llama_context * ctx, llama_seq_id seq_id, float scale);
+
+    // projections read for the sequence's most recently decoded token, in ascending layer order;
+    // returns how many were written
+    LLAMA_API int32_t llama_steer_get_readout(
+            struct llama_context * ctx,
+                    llama_seq_id   seq_id,
+                           float * out,
+                         int32_t   n_max);
+
+    // record the projections read for every token of a sequence, starting now (on) or discarding them (off)
+    LLAMA_API void llama_steer_record(struct llama_context * ctx, llama_seq_id seq_id, bool on);
+
+    // hand over and stop a sequence's record, token-major, returning how many values were written;
+    // with out == NULL, returns the record's length and keeps recording
+    LLAMA_API int64_t llama_steer_take_record(
+            struct llama_context * ctx,
+                    llama_seq_id   seq_id,
+                           float * out,
+                         int64_t   n_max);
+
     //
     // Memory
     //
