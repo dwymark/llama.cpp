@@ -238,10 +238,14 @@ struct server_slot {
     std::vector<completion_token_output> generated_token_probs;
 
     // steering state for this request; the trigger is a one-sided cumulative sum on one read layer's
-    // projection that switches the scale to `on` for `hold` tokens (for good if hold <= 0) when it exceeds h
+    // projection that switches the scale to `on` for `hold` tokens (for good if hold <= 0) when it exceeds h.
+    // The gain mode instead sets the scale every token to on * sigmoid((x - g * scale - c) / w), where
+    // g * scale removes the part of the reading x that the scale in force put there.
     struct steer_state {
         bool  active    = false;
         bool  trigger   = false;
+        bool  gain      = false;
+        float c = 0.0f, w = 1.0f, g = 0.0f;
         int   trig_idx  = -1; // position of the trigger layer among the read layers
         float mu = 0.0f, k = 0.0f, h = 0.0f, on = 0.0f, off = 0.0f;
         int   hold      = 0;
@@ -1679,6 +1683,28 @@ private:
         auto & s = slot.steer;
         s.active = true;
         s.scale  = json_value(st, "scale", 0.0f);
+        if (st.contains("trigger") && st.contains("gain")) {
+            err = "trigger and gain are exclusive";
+            return false;
+        }
+        if (st.contains("gain")) {
+            const json & t = st.at("gain");
+            const int layer = t.at("layer").get<int>();
+            auto sorted = json_value(st, "read", std::vector<int>());
+            std::sort(sorted.begin(), sorted.end());
+            auto it = std::find(sorted.begin(), sorted.end(), layer);
+            if (it == sorted.end()) {
+                err = "the gain layer must be read";
+                return false;
+            }
+            s.gain     = true;
+            s.trig_idx = it - sorted.begin();
+            s.on = t.at("on").get<float>();
+            s.c  = t.at("c").get<float>();
+            s.w  = t.at("w").get<float>();
+            s.g  = json_value(t, "g", 0.0f);
+            s.scale = 0.0f;
+        }
         if (st.contains("trigger")) {
             const json & t = st.at("trigger");
             const int layer = t.at("layer").get<int>();
@@ -1814,6 +1840,11 @@ private:
         }
         if (n > 0) {
             s.readout.push_back(std::vector<float>(buf, buf + n));
+        }
+        if (s.gain && n > s.trig_idx) {
+            const float x = buf[s.trig_idx] - s.g * s.scale;
+            s.scale = s.on / (1.0f + std::exp(-(x - s.c) / s.w));
+            llama_steer_set_scale(ctx_tgt, slot.id, s.scale);
         }
         if (s.trigger && n > s.trig_idx) {
             float x = buf[s.trig_idx];
