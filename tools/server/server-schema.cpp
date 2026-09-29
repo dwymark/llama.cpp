@@ -238,8 +238,7 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
 
     add((new field_json("steer"))
         ->set_desc("Steer this request with a named control vector from the directory in STEER_DIR: "
-                   "{vector, scale, add: [first, last], read: [layers], cap: {layers: [first, last], tau: number or {layer: number}}, "
-                   "trigger: {layer, mu, k, h, on, off, hold, diff}, or gain: {layer, on, c, w, g}}")
+                   "{vector, scale, add: [first, last], read: [layers], read_prompt, cap: {layers: [first, last], tau: number or {layer: number}}}")
         ->set_handler([&](field_eval_context & ctx, const json & data) {
             ctx.params.steer = data.at("steer");
         }));

@@ -237,28 +237,12 @@ struct server_slot {
 
     std::vector<completion_token_output> generated_token_probs;
 
-    // steering state for this request; the trigger is a one-sided cumulative sum on one read layer's
-    // projection that switches the scale to `on` for `hold` tokens (for good if hold <= 0) when it exceeds h.
-    // The gain mode instead sets the scale every token to on * sigmoid((x - g * scale - c) / w), where
-    // g * scale removes the part of the reading x that the scale in force put there.
+    // steering state for this request
     struct steer_state {
-        bool  active    = false;
-        bool  trigger   = false;
-        bool  gain      = false;
-        float c = 0.0f, w = 1.0f, g = 0.0f;
-        int   trig_idx  = -1; // position of the trigger layer among the read layers
-        float mu = 0.0f, k = 0.0f, h = 0.0f, on = 0.0f, off = 0.0f;
-        int   hold      = 0;
-        int   hold_left = 0;
-        int   fired     = 0;
-        bool  diff      = false;
-        float prev      = NAN;
-        float sum       = 0.0f;
-        float scale     = 0.0f;
-        bool  record    = false;         // read every prompt token too
-        json  prompt_readout = json::array();
-        json  readout   = json::array(); // per decoded token of this slot, the projections read
-        std::vector<float> scales;       // the scale in force after each generated token
+        bool active = false;
+        bool record = false;             // read every prompt token too
+        json prompt_readout = json::array();
+        json readout = json::array();    // per decoded token of this slot, the projections read
     } steer;
 
     bool has_next_token = true;
@@ -1641,7 +1625,7 @@ private:
     }
 
     // Applies a request's steering. Vectors are named, never given by path, and load from STEER_DIR.
-    // Everything but scale and trigger is shared by the whole context, so a request whose
+    // Everything but scale and read_prompt is shared by the whole context, so a request whose
     // configuration differs from the one in force is refused while another slot is busy.
     // Read and capped layers use the unit direction of the file's next layer, since
     // llama-cvector-generator stores the difference at layer K's output as direction.K+1.
@@ -1650,7 +1634,6 @@ private:
         json shared = st.is_object() ? st : json();
         if (shared.is_object()) {
             shared.erase("scale");
-            shared.erase("trigger");
             shared.erase("read_prompt");
         }
         const std::string key = shared.is_null() ? "" : shared.dump();
@@ -1675,6 +1658,7 @@ private:
         if (key.empty()) {
             return true;
         }
+        // rejected drafts would leave their projections in the readout
         if (slot.can_speculate()) {
             err = "steering does not support speculative decoding";
             return false;
@@ -1682,52 +1666,7 @@ private:
 
         auto & s = slot.steer;
         s.active = true;
-        s.scale  = json_value(st, "scale", 0.0f);
-        if (st.contains("trigger") && st.contains("gain")) {
-            err = "trigger and gain are exclusive";
-            return false;
-        }
-        if (st.contains("gain")) {
-            const json & t = st.at("gain");
-            const int layer = t.at("layer").get<int>();
-            auto sorted = json_value(st, "read", std::vector<int>());
-            std::sort(sorted.begin(), sorted.end());
-            auto it = std::find(sorted.begin(), sorted.end(), layer);
-            if (it == sorted.end()) {
-                err = "the gain layer must be read";
-                return false;
-            }
-            s.gain     = true;
-            s.trig_idx = it - sorted.begin();
-            s.on = t.at("on").get<float>();
-            s.c  = t.at("c").get<float>();
-            s.w  = t.at("w").get<float>();
-            s.g  = json_value(t, "g", 0.0f);
-            s.scale = 0.0f;
-        }
-        if (st.contains("trigger")) {
-            const json & t = st.at("trigger");
-            const int layer = t.at("layer").get<int>();
-            const auto read = json_value(st, "read", std::vector<int>());
-            std::vector<int> sorted(read);
-            std::sort(sorted.begin(), sorted.end());
-            auto it = std::find(sorted.begin(), sorted.end(), layer);
-            if (it == sorted.end()) {
-                err = "the trigger layer must be read";
-                return false;
-            }
-            s.trigger  = true;
-            s.trig_idx = it - sorted.begin();
-            s.mu   = json_value(t, "mu", 0.0f);
-            s.k    = json_value(t, "k", 0.0f);
-            s.h    = t.at("h").get<float>();
-            s.on   = t.at("on").get<float>();
-            s.off  = json_value(t, "off", s.scale);
-            s.hold = json_value(t, "hold", 0);
-            s.diff = json_value(t, "diff", false);
-            s.scale = s.off;
-        }
-        llama_steer_set_scale(ctx_tgt, slot.id, s.scale);
+        llama_steer_set_scale(ctx_tgt, slot.id, json_value(st, "scale", 0.0f));
         s.record = json_value(st, "read_prompt", false);
         llama_steer_record(ctx_tgt, slot.id, s.record);
         return true;
@@ -1824,7 +1763,7 @@ private:
         return true;
     }
 
-    // records the projections read for the slot's latest token and advances its trigger
+    // records the projections read for the slot's latest token
     void steer_after_token(server_slot & slot) {
         auto & s = slot.steer;
         float buf[256];
@@ -1841,34 +1780,6 @@ private:
         if (n > 0) {
             s.readout.push_back(std::vector<float>(buf, buf + n));
         }
-        if (s.gain && n > s.trig_idx) {
-            const float x = buf[s.trig_idx] - s.g * s.scale;
-            s.scale = s.on / (1.0f + std::exp(-(x - s.c) / s.w));
-            llama_steer_set_scale(ctx_tgt, slot.id, s.scale);
-        }
-        if (s.trigger && n > s.trig_idx) {
-            float x = buf[s.trig_idx];
-            if (s.diff) {
-                const float dx = std::isnan(s.prev) ? 0.0f : x - s.prev;
-                s.prev = x;
-                x = dx;
-            }
-            if (s.hold_left > 0) {
-                if (--s.hold_left == 0) {
-                    s.scale = s.off;
-                    s.sum   = 0.0f;
-                }
-            } else if (s.scale == s.off) {
-                s.sum = std::max(0.0f, s.sum + x - s.mu - s.k);
-                if (s.sum > s.h) {
-                    s.fired++;
-                    s.scale     = s.on;
-                    s.hold_left = s.hold;
-                }
-            }
-            llama_steer_set_scale(ctx_tgt, slot.id, s.scale);
-        }
-        s.scales.push_back(s.scale);
     }
 
     bool launch_slot_with_task(server_slot & slot, server_task && task) {
@@ -2266,8 +2177,6 @@ private:
             res->steer_out = {
                 {"prompt_readout", slot.steer.prompt_readout},
                 {"readout", slot.steer.readout},
-                {"scale",   slot.steer.scales},
-                {"fired",   slot.steer.fired},
             };
         }
 
