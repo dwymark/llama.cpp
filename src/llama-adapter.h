@@ -22,7 +22,8 @@ struct llama_adapter_cvec {
 
     // steering mode, entered by steer_configure: per-layer flags choose which layers add the
     // direction (scaled per token by `scale`, F32 [1, n_tokens]), read the projection onto the
-    // layer's unit direction, and cap it from below; projections read are appended to `readout`
+    // layer's unit direction, cap it from below, and read the whole state; what is read is
+    // appended to `readout`, one F32 [width, n_tokens] tensor per projection or state
     ggml_tensor * apply_steer(ggml_context * ctx, ggml_tensor * cur, int il, ggml_tensor * scale,
                               std::vector<std::pair<int, ggml_tensor *>> & readout) const;
 

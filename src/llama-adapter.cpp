@@ -34,6 +34,7 @@ ggml_tensor * llama_adapter_cvec::apply_steer(ggml_context * ctx, ggml_tensor * 
         return cur;
     }
     const uint8_t f = steer_flags[il];
+    ggml_tensor * const in = cur;
 
     if (f & (LLAMA_STEER_READ | LLAMA_STEER_CAP)) {
         // [1, n_tokens]: the incoming state's projection, before this layer's own steering
@@ -47,6 +48,12 @@ ggml_tensor * llama_adapter_cvec::apply_steer(ggml_context * ctx, ggml_tensor * 
             ggml_tensor * lift = ggml_relu(ctx, ggml_add(ctx, ggml_neg(ctx, proj), taus[il]));
             cur = ggml_add(ctx, cur, ggml_mul(ctx, ggml_repeat(ctx, units[il], cur), lift));
         }
+    }
+    if (f & LLAMA_STEER_STATE) {
+        // [n_embd, n_tokens], copied so the allocator keeps it apart from the steered state
+        ggml_tensor * state = ggml_cont(ctx, in);
+        ggml_set_output(state);
+        readout.emplace_back(il, state);
     }
     if (f & LLAMA_STEER_ADD) {
         cur = ggml_add(ctx, cur, ggml_mul(ctx, ggml_repeat(ctx, tensors[il], cur), scale));

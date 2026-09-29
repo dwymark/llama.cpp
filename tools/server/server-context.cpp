@@ -8,6 +8,7 @@
 #include "server-stream.h"
 
 #include "build-info.h"
+#include "base64.hpp"
 #include "common.h"
 #include "fit.h"
 #include "llama.h"
@@ -243,6 +244,8 @@ struct server_slot {
         bool record = false;             // read every prompt token too
         json prompt_readout = json::array();
         json readout = json::array();    // per decoded token of this slot, the projections read
+        std::vector<float> prompt_states; // token-major, then state layers ascending, n_embd each
+        std::vector<float> states;
     } steer;
 
     bool has_next_token = true;
@@ -859,6 +862,12 @@ private:
     // steering configuration the context carries: the request's steer field without its per-slot parts
     std::string steer_key;
     std::map<std::string, common_control_vector_data> steer_vectors; // loaded files by name
+
+    // where a token's readout row keeps each projection and each state, under the configuration in force
+    size_t steer_row = 0;
+    std::vector<size_t> steer_proj_at;
+    std::vector<size_t> steer_state_at;
+    std::vector<int>    steer_state_layers;
 
     bool add_bos_token = true;
 
@@ -1678,7 +1687,28 @@ private:
             err = "the server was started without STEER_DIR";
             return false;
         }
+        const int n_layer = llama_model_n_layer(model_tgt);
+        const int n_embd  = llama_model_n_embd(model_tgt);
+        std::vector<uint8_t> flags(n_layer, 0);
+        for (int il : json_value(st, "state", std::vector<int>())) {
+            if (il < 1 || il >= n_layer) {
+                err = "state layer out of range";
+                return false;
+            }
+            flags[il] |= LLAMA_STEER_STATE;
+        }
+
         const std::string name = json_value(st, "vector", std::string());
+        // reading states alone needs no vector
+        if (name.empty() && !st.contains("add") && !st.contains("read") && !st.contains("cap")) {
+            if (llama_steer_configure(ctx_tgt, nullptr, flags.data(), n_layer) != 0) {
+                err = "cannot apply the configuration";
+                return false;
+            }
+            steer_layout(flags, n_embd);
+            SRV_INF("steering without a vector: %s\n", st.dump().c_str());
+            return true;
+        }
         if (name.empty() || name.find("..") != std::string::npos ||
                 name.find_first_not_of("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-") != std::string::npos) {
             err = "vector must be a plain name";
@@ -1693,15 +1723,12 @@ private:
             steer_vectors[name] = std::move(v);
         }
         const auto & v = steer_vectors[name];
-        const int n_layer = llama_model_n_layer(model_tgt);
-        const int n_embd  = llama_model_n_embd(model_tgt);
         if (v.n_embd != n_embd) {
             err = "vector does not match the model's width";
             return false;
         }
         const int n_file = v.data.size() / n_embd; // file layers 1..n_file
 
-        std::vector<uint8_t> flags(n_layer, 0);
         auto band = [&](const json & b, uint8_t f) {
             const int lo = b.at(0).get<int>(), hi = b.at(1).get<int>();
             for (int il = std::max(1, lo); il <= std::min(n_layer - 1, hi); il++) {
@@ -1759,26 +1786,58 @@ private:
         }
         llama_steer_set_tau(ctx_tgt, tau.data(), n_layer);
         llama_steer_set_scale(ctx_tgt, -1, 0.0f);
+        steer_layout(flags, n_embd);
         SRV_INF("steering with %s: %s\n", name.c_str(), st.dump().c_str());
         return true;
     }
 
-    // records the projections read for the slot's latest token
+    // keep in step with the readout order stated at llama_steer_flag in llama.h
+    void steer_layout(const std::vector<uint8_t> & flags, int n_embd) {
+        steer_row = 0;
+        steer_proj_at.clear();
+        steer_state_at.clear();
+        steer_state_layers.clear();
+        for (size_t il = 1; il < flags.size(); il++) {
+            if (flags[il] & LLAMA_STEER_READ) {
+                steer_proj_at.push_back(steer_row++);
+            }
+            if (flags[il] & LLAMA_STEER_STATE) {
+                steer_state_at.push_back(steer_row);
+                steer_state_layers.push_back(il);
+                steer_row += n_embd;
+            }
+        }
+    }
+
+    // splits a readout row into its projections, as a JSON row, and its states, appended to `states`
+    json steer_split(const float * row, std::vector<float> & states) const {
+        std::vector<float> proj;
+        for (size_t at : steer_proj_at) {
+            proj.push_back(row[at]);
+        }
+        const size_t n_embd = llama_model_n_embd(model_tgt);
+        for (size_t at : steer_state_at) {
+            states.insert(states.end(), row + at, row + at + n_embd);
+        }
+        return proj;
+    }
+
+    // records the readout of the slot's latest token
     void steer_after_token(server_slot & slot) {
         auto & s = slot.steer;
-        float buf[256];
-        const int n = llama_steer_get_readout(ctx_tgt, slot.id, buf, 256);
+        std::vector<float> buf(steer_row);
+        const int n = llama_steer_get_readout(ctx_tgt, slot.id, buf.data(), buf.size());
         if (s.record) {
-            // the first sampled token closes the prompt: its record holds every prompt token's projections
+            // the first sampled token closes the prompt: its record holds every prompt token's readout
             std::vector<float> rec(llama_steer_take_record(ctx_tgt, slot.id, nullptr, 0));
             const int64_t n_rec = llama_steer_take_record(ctx_tgt, slot.id, rec.data(), rec.size());
             for (int64_t i = 0; n > 0 && i + n <= n_rec; i += n) {
-                s.prompt_readout.push_back(std::vector<float>(rec.begin() + i, rec.begin() + i + n));
+                s.prompt_readout.push_back(steer_split(rec.data() + i, s.prompt_states));
             }
             s.record = false;
         }
         if (n > 0) {
-            s.readout.push_back(std::vector<float>(buf, buf + n));
+            s.readout.push_back(steer_split(buf.data(), s.states));
         }
     }
 
@@ -2178,6 +2237,15 @@ private:
                 {"prompt_readout", slot.steer.prompt_readout},
                 {"readout", slot.steer.readout},
             };
+            if (!steer_state_layers.empty()) {
+                // raw little-endian F32, token-major, then state layers ascending, n_embd each
+                const auto b64 = [](const std::vector<float> & v) {
+                    return base64::encode(reinterpret_cast<const char *>(v.data()), v.size()*sizeof(float));
+                };
+                res->steer_out["state_layers"]  = steer_state_layers;
+                res->steer_out["prompt_states"] = b64(slot.steer.prompt_states);
+                res->steer_out["states"]        = b64(slot.steer.states);
+            }
         }
 
         // keep copy of last generated text for debugging purposes

@@ -1052,7 +1052,7 @@ public:
     std::vector<ggml_tensor *> t_layer_inp;
 
     ggml_tensor * t_steer_scale = nullptr;
-    std::vector<std::pair<int, ggml_tensor *>> t_readout; // (layer, F32 [1, n_tokens] projection)
+    std::vector<std::pair<int, ggml_tensor *>> t_readout; // (layer, F32 [1 or n_embd, n_tokens] projection or state)
 
     std::vector<ggml_tensor *> t_sampled;
     std::vector<ggml_tensor *> t_dspark_greedy;

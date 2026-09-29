@@ -309,10 +309,10 @@ private:
 
     llama_adapter_cvec_ptr  cvec;
 
-    // per sequence, the projections read for its most recently decoded token, in ascending layer order
+    // per sequence, the readout of its most recently decoded token
     std::map<llama_seq_id, std::vector<float>> steer_readout;
 
-    // per recorded sequence, the projections read for every token decoded since recording began
+    // per recorded sequence, the readout of every token decoded since recording began
     std::map<llama_seq_id, std::vector<float>> steer_record;
     llama_adapter_loras_ptr loras;
 

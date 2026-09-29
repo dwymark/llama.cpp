@@ -1531,17 +1531,24 @@ bool llama_context::adapters_lora_are_same(llama_adapter_lora ** adapters, size_
 
 void llama_context::steer_extract_readout(const llm_graph_result * res, const llama_ubatch & ubatch) {
     ggml_backend_sched_synchronize(sched.get());
-    const size_t n_read = res->t_readout.size();
-    std::vector<float> buf(n_read*ubatch.n_tokens);
-    for (size_t r = 0; r < n_read; ++r) {
-        ggml_backend_tensor_get(res->t_readout[r].second, buf.data() + r*ubatch.n_tokens, 0, ubatch.n_tokens*sizeof(float));
+    const uint32_t n_tokens = ubatch.n_tokens;
+    // each tensor is [width, n_tokens]: width 1 for a projection, n_embd for a state
+    std::vector<std::vector<float>> bufs;
+    size_t n_row = 0;
+    for (const auto & [il, t] : res->t_readout) {
+        bufs.emplace_back(t->ne[0]*n_tokens);
+        ggml_backend_tensor_get(t, bufs.back().data(), 0, bufs.back().size()*sizeof(float));
+        n_row += t->ne[0];
     }
-    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+    for (uint32_t i = 0; i < n_tokens; ++i) {
         const llama_seq_id seq = ubatch.seq_id[i][0];
         auto & row = steer_readout[seq];
-        row.resize(n_read);
-        for (size_t r = 0; r < n_read; ++r) {
-            row[r] = buf[r*ubatch.n_tokens + i];
+        row.resize(n_row);
+        size_t off = 0;
+        for (const auto & b : bufs) {
+            const size_t w = b.size()/n_tokens;
+            std::copy_n(b.begin() + i*w, w, row.begin() + off);
+            off += w;
         }
         auto it = steer_record.find(seq);
         if (it != steer_record.end()) {

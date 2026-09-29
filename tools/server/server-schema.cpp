@@ -238,7 +238,8 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
 
     add((new field_json("steer"))
         ->set_desc("Steer this request with a named control vector from the directory in STEER_DIR: "
-                   "{vector, scale, add: [first, last], read: [layers], read_prompt, cap: {layers: [first, last], tau: number or {layer: number}}}")
+                   "{vector, scale, add: [first, last], read: [layers], read_prompt, cap: {layers: [first, last], tau: number or {layer: number}}, "
+                   "state: [layers]}; state returns each token's whole hidden state at those layers as base64 F32, and needs no vector alone")
         ->set_handler([&](field_eval_context & ctx, const json & data) {
             ctx.params.steer = data.at("steer");
         }));

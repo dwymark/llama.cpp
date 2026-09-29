@@ -1569,9 +1569,9 @@ ggml_tensor * llm_graph_context::build_cvec(
     }
     const size_t n_read = res->t_readout.size();
     cur = cvec->apply_steer(ctx0, cur, il, res->t_steer_scale, res->t_readout);
-    if (res->t_readout.size() > n_read) {
-        // a projection only read, never used downstream, must still be computed
-        ggml_build_forward_expand(gf, res->t_readout.back().second);
+    // what is only read, never used downstream, must still be computed
+    for (size_t r = n_read; r < res->t_readout.size(); ++r) {
+        ggml_build_forward_expand(gf, res->t_readout[r].second);
     }
     return cur;
 }

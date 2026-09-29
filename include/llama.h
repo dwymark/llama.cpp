@@ -738,14 +738,17 @@ extern "C" {
 
     // Steering beyond a constant control vector. After llama_set_adapter_cvec loads per-layer
     // directions, llama_steer_configure takes per-layer flags (1 add the direction, 2 read the
-    // projection onto the unit direction, 4 cap that projection from below at tau) and unit
-    // directions, both for all n_layer layers from layer 0; NULL flags return to plain control
-    // vectors. In steering mode the layer range given to llama_set_adapter_cvec is ignored.
-    // Projections are read before the layer's own steering is applied.
+    // projection onto the unit direction, 4 cap that projection from below at tau, 8 read the
+    // whole n_embd hidden state) and unit directions, both for all n_layer layers from layer 0;
+    // NULL flags return to plain control vectors. In steering mode the layer range given to
+    // llama_set_adapter_cvec is ignored. Projections and states are read before the layer's own
+    // steering is applied. A token's readout holds, for each layer in ascending order, its
+    // projection if the layer reads and then its state if the layer reads states.
     enum llama_steer_flag {
-        LLAMA_STEER_ADD  = 1,
-        LLAMA_STEER_READ = 2,
-        LLAMA_STEER_CAP  = 4,
+        LLAMA_STEER_ADD   = 1,
+        LLAMA_STEER_READ  = 2,
+        LLAMA_STEER_CAP   = 4,
+        LLAMA_STEER_STATE = 8,
     };
 
     LLAMA_API int32_t llama_steer_configure(
@@ -760,15 +763,14 @@ extern "C" {
     // the factor on the added direction for a sequence's tokens; seq_id < 0 sets the default for all
     LLAMA_API void llama_steer_set_scale(struct llama_context * ctx, llama_seq_id seq_id, float scale);
 
-    // projections read for the sequence's most recently decoded token, in ascending layer order;
-    // returns how many were written
+    // the readout of the sequence's most recently decoded token; returns how many values were written
     LLAMA_API int32_t llama_steer_get_readout(
             struct llama_context * ctx,
                     llama_seq_id   seq_id,
                            float * out,
                          int32_t   n_max);
 
-    // record the projections read for every token of a sequence, starting now (on) or discarding them (off)
+    // record the readout of every token of a sequence, starting now (on) or discarding it (off)
     LLAMA_API void llama_steer_record(struct llama_context * ctx, llama_seq_id seq_id, bool on);
 
     // hand over and stop a sequence's record, token-major, returning how many values were written;
