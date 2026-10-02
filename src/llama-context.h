@@ -141,6 +141,14 @@ struct llama_context {
 
     bool adapters_lora_are_same(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
 
+    bool steer_configure(const float * unit, const uint8_t * flags, int32_t n_layer);
+    int32_t steer_get_readout(llama_seq_id seq_id, float * out, int32_t n_max) const;
+    llama_adapter_cvec * steer_cvec() { return cvec.get(); }
+    void steer_extract_readout(const llm_graph_result * res, const llama_ubatch & ubatch);
+    void steer_set_record(llama_seq_id seq_id, bool on);
+    std::vector<float> steer_take_record(llama_seq_id seq_id);
+    size_t steer_record_size(llama_seq_id seq_id) const;
+
     bool set_adapter_cvec(
             const float * data,
                  size_t   len,
@@ -300,6 +308,12 @@ private:
     llama_cparams cparams;
 
     llama_adapter_cvec_ptr  cvec;
+
+    // per sequence, the readout of its most recently decoded token
+    std::map<llama_seq_id, std::vector<float>> steer_readout;
+
+    // per recorded sequence, the readout of every token decoded since recording began
+    std::map<llama_seq_id, std::vector<float>> steer_record;
     llama_adapter_loras_ptr loras;
 
     llama_cross cross; // TODO: tmp for handling cross-attention - need something better probably

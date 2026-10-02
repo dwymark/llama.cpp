@@ -69,6 +69,8 @@ struct task_params {
 
     std::map<int, float> lora; // mapping adapter ID -> scale
 
+    json steer; // steering request, see server_context_impl::steer_launch
+
     std::vector<std::string> antiprompt;
     std::vector<std::string> response_fields;
 
@@ -338,6 +340,8 @@ struct server_task_result_cmpl_final : server_task_result {
     bool post_sampling_probs;
     std::vector<completion_token_output> probs_output;
     std::vector<std::string>  response_fields;
+
+    json steer_out; // per-token projections and scales of a steered request
 
     task_params generation_params;
 

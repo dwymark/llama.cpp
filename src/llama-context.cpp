@@ -1529,6 +1529,57 @@ bool llama_context::adapters_lora_are_same(llama_adapter_lora ** adapters, size_
     return true;
 }
 
+void llama_context::steer_extract_readout(const llm_graph_result * res, const llama_ubatch & ubatch) {
+    ggml_backend_sched_synchronize(sched.get());
+    const uint32_t n_tokens = ubatch.n_tokens;
+    // each tensor is [width, n_tokens]: width 1 for a projection, n_embd for a state
+    std::vector<std::vector<float>> bufs;
+    size_t n_row = 0;
+    for (const auto & [il, t] : res->t_readout) {
+        bufs.emplace_back(t->ne[0]*n_tokens);
+        ggml_backend_tensor_get(t, bufs.back().data(), 0, bufs.back().size()*sizeof(float));
+        n_row += t->ne[0];
+    }
+    for (uint32_t i = 0; i < n_tokens; ++i) {
+        const llama_seq_id seq = ubatch.seq_id[i][0];
+        auto & row = steer_readout[seq];
+        row.resize(n_row);
+        size_t off = 0;
+        for (const auto & b : bufs) {
+            const size_t w = b.size()/n_tokens;
+            std::copy_n(b.begin() + i*w, w, row.begin() + off);
+            off += w;
+        }
+        auto it = steer_record.find(seq);
+        if (it != steer_record.end()) {
+            it->second.insert(it->second.end(), row.begin(), row.end());
+        }
+    }
+}
+
+void llama_context::steer_set_record(llama_seq_id seq_id, bool on) {
+    if (on) {
+        steer_record[seq_id].clear();
+    } else {
+        steer_record.erase(seq_id);
+    }
+}
+
+size_t llama_context::steer_record_size(llama_seq_id seq_id) const {
+    auto it = steer_record.find(seq_id);
+    return it == steer_record.end() ? 0 : it->second.size();
+}
+
+std::vector<float> llama_context::steer_take_record(llama_seq_id seq_id) {
+    std::vector<float> out;
+    auto it = steer_record.find(seq_id);
+    if (it != steer_record.end()) {
+        out = std::move(it->second);
+        steer_record.erase(it);
+    }
+    return out;
+}
+
 bool llama_context::set_adapter_cvec(
             const float * data,
                  size_t   len,
@@ -1542,6 +1593,23 @@ bool llama_context::set_adapter_cvec(
     sched_need_reserve = true;
 
     return res;
+}
+
+bool llama_context::steer_configure(const float * unit, const uint8_t * flags, int32_t n_layer) {
+    bool res = cvec->steer_configure(model, unit, flags, n_layer);
+    steer_readout.clear();
+    sched_need_reserve = true;
+    return res;
+}
+
+int32_t llama_context::steer_get_readout(llama_seq_id seq_id, float * out, int32_t n_max) const {
+    auto it = steer_readout.find(seq_id);
+    if (it == steer_readout.end()) {
+        return 0;
+    }
+    const int32_t n = std::min<int32_t>(n_max, it->second.size());
+    std::copy_n(it->second.begin(), n, out);
+    return n;
 }
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
@@ -2087,6 +2155,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
         //if (n_past%100 == 0) {
         //    ggml_graph_dump_dot(gf, NULL, "llama.dot");
         //}
+
+        if (!res->t_readout.empty()) {
+            steer_extract_readout(res, ubatch);
+        }
 
         auto * t_logits  = res->get_logits();
         auto * t_embd    = cparams.embeddings       ? res->get_embd()     : nullptr;
@@ -2730,7 +2802,7 @@ llm_graph_params llama_context::graph_params(
                       const llama_ubatch & ubatch,
             const llama_memory_context_i * mctx,
                           llm_graph_type   gtype) const {
-    return {
+    llm_graph_params p = {
         /*.arch        =*/model.arch,
         /*.hparams     =*/model.hparams,
         /*.cparams     =*/cparams,
@@ -2753,6 +2825,8 @@ llm_graph_params llama_context::graph_params(
         /*.cb          =*/graph_get_cb(),
         /*.res         =*/res,
     };
+    p.cvec_version = cvec->version;
+    return p;
 }
 
 ggml_status llama_context::graph_compute(
@@ -4207,6 +4281,46 @@ int32_t llama_set_adapters_lora(
     ctx->set_adapters_lora(adapters, n_adapters, scales);
 
     return 0;
+}
+
+int32_t llama_steer_configure(
+        llama_context * ctx,
+          const float * unit,
+        const uint8_t * flags,
+              int32_t   n_layer) {
+    return ctx->steer_configure(unit, flags, n_layer) ? 0 : -1;
+}
+
+void llama_steer_set_tau(llama_context * ctx, const float * tau, int32_t n_layer) {
+    ctx->steer_cvec()->steer_set_tau(tau, n_layer);
+}
+
+void llama_steer_set_scale(llama_context * ctx, llama_seq_id seq_id, float scale) {
+    auto * cvec = ctx->steer_cvec();
+    if (seq_id < 0) {
+        cvec->scale_default = scale;
+        cvec->seq_scale.clear();
+    } else {
+        cvec->seq_scale[seq_id] = scale;
+    }
+}
+
+int32_t llama_steer_get_readout(llama_context * ctx, llama_seq_id seq_id, float * out, int32_t n_max) {
+    return ctx->steer_get_readout(seq_id, out, n_max);
+}
+
+void llama_steer_record(llama_context * ctx, llama_seq_id seq_id, bool on) {
+    ctx->steer_set_record(seq_id, on);
+}
+
+int64_t llama_steer_take_record(llama_context * ctx, llama_seq_id seq_id, float * out, int64_t n_max) {
+    if (out == nullptr) {
+        return ctx->steer_record_size(seq_id);
+    }
+    const auto rec = ctx->steer_take_record(seq_id);
+    const int64_t n = std::min<int64_t>(n_max, rec.size());
+    std::copy_n(rec.begin(), n, out);
+    return n;
 }
 
 int32_t llama_set_adapter_cvec(

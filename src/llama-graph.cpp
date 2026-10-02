@@ -192,6 +192,18 @@ void llm_graph_input_pos::set_input(const llama_ubatch * ubatch) {
     }
 }
 
+void llm_graph_input_steer::set_input(const llama_ubatch * ubatch) {
+    std::vector<float> data(ubatch->n_tokens);
+    for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
+        data[i] = cvec->scale_for(ubatch->seq_id[i][0]);
+    }
+    ggml_backend_tensor_set(scale, data.data(), 0, data.size()*sizeof(float));
+}
+
+bool llm_graph_input_steer::can_reuse(const llm_graph_params & params) {
+    return scale->ne[1] == params.ubatch.n_tokens;
+}
+
 bool llm_graph_input_pos::can_reuse(const llm_graph_params & params) {
     bool res = true;
 
@@ -1352,6 +1364,9 @@ void llm_graph_result::reset() {
     t_layer_inp.resize(LLAMA_MAX_LAYERS + 1);
     std::fill(t_layer_inp.begin(), t_layer_inp.end(), nullptr);
 
+    t_steer_scale = nullptr;
+    t_readout.clear();
+
     t_sampled.clear();
     t_dspark_greedy.clear();
     t_sampled_probs.clear();
@@ -1540,7 +1555,25 @@ void llm_graph_context::cb(ggml_tensor * cur, const char * name, int il) const {
 ggml_tensor * llm_graph_context::build_cvec(
          ggml_tensor * cur,
                  int   il) const {
-    return cvec->apply_to(ctx0, cur, il);
+    if (!cvec->steering()) {
+        return cvec->apply_to(ctx0, cur, il);
+    }
+    // the scale input exists only in graphs that add; an input nothing reads is never allocated
+    const bool adds = (size_t) il < cvec->steer_flags.size() && (cvec->steer_flags[il] & LLAMA_STEER_ADD);
+    if (adds && res->t_steer_scale == nullptr) {
+        auto inp = std::make_unique<llm_graph_input_steer>(cvec);
+        inp->scale = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 1, n_tokens);
+        ggml_set_input(inp->scale);
+        res->t_steer_scale = inp->scale;
+        res->add_input(std::move(inp));
+    }
+    const size_t n_read = res->t_readout.size();
+    cur = cvec->apply_steer(ctx0, cur, il, res->t_steer_scale, res->t_readout);
+    // what is only read, never used downstream, must still be computed
+    for (size_t r = n_read; r < res->t_readout.size(); ++r) {
+        ggml_build_forward_expand(gf, res->t_readout[r].second);
+    }
+    return cur;
 }
 
 ggml_tensor * llm_graph_context::build_lora_mm(

@@ -28,6 +28,85 @@ ggml_tensor * llama_adapter_cvec::apply_to(ggml_context * ctx, ggml_tensor * cur
     return cur;
 }
 
+ggml_tensor * llama_adapter_cvec::apply_steer(ggml_context * ctx, ggml_tensor * cur, int il, ggml_tensor * scale,
+                                             std::vector<std::pair<int, ggml_tensor *>> & readout) const {
+    if (il <= 0 || (size_t) il >= steer_flags.size() || steer_flags[il] == 0) {
+        return cur;
+    }
+    const uint8_t f = steer_flags[il];
+    ggml_tensor * const in = cur;
+
+    if (f & (LLAMA_STEER_READ | LLAMA_STEER_CAP)) {
+        // [1, n_tokens]: the incoming state's projection, before this layer's own steering
+        ggml_tensor * proj = ggml_mul_mat(ctx, units[il], cur);
+        if (f & LLAMA_STEER_READ) {
+            ggml_set_output(proj);
+            readout.emplace_back(il, proj);
+        }
+        if (f & LLAMA_STEER_CAP) {
+            // lift each token whose projection falls below tau just up to it
+            ggml_tensor * lift = ggml_relu(ctx, ggml_add(ctx, ggml_neg(ctx, proj), taus[il]));
+            cur = ggml_add(ctx, cur, ggml_mul(ctx, ggml_repeat(ctx, units[il], cur), lift));
+        }
+    }
+    if (f & LLAMA_STEER_STATE) {
+        // [n_embd, n_tokens], copied so the allocator keeps it apart from the steered state
+        ggml_tensor * state = ggml_cont(ctx, in);
+        ggml_set_output(state);
+        readout.emplace_back(il, state);
+    }
+    if (f & LLAMA_STEER_ADD) {
+        cur = ggml_add(ctx, cur, ggml_mul(ctx, ggml_repeat(ctx, tensors[il], cur), scale));
+    }
+    return cur;
+}
+
+float llama_adapter_cvec::scale_for(llama_seq_id seq_id) const {
+    auto it = seq_scale.find(seq_id);
+    return it == seq_scale.end() ? scale_default : it->second;
+}
+
+bool llama_adapter_cvec::steer_configure(const llama_model & model, const float * unit, const uint8_t * flags, int32_t n_layer) {
+    const auto & hparams = model.hparams;
+
+    version++;
+    if (flags == nullptr) {
+        steer_flags.clear();
+        read_layers.clear();
+        return true;
+    }
+    if (n_layer != (int32_t) hparams.n_layer()) {
+        LLAMA_LOG_ERROR("%s: %d layers of flags for a %u-layer model\n", __func__, n_layer, hparams.n_layer());
+        return false;
+    }
+    if (tensors.empty() && !init(model)) {
+        return false;
+    }
+    steer_flags.assign(flags, flags + n_layer);
+    steer_flags[0] = 0; // layer 0 has no tensors
+    read_layers.clear();
+    for (int il = 1; il < n_layer; il++) {
+        if ((steer_flags[il] & (LLAMA_STEER_READ | LLAMA_STEER_CAP)) && unit == nullptr) {
+            LLAMA_LOG_ERROR("%s: layer %d reads or caps without a unit direction\n", __func__, il);
+            steer_flags.clear();
+            return false;
+        }
+        if (steer_flags[il] & LLAMA_STEER_READ) {
+            read_layers.push_back(il);
+        }
+        if (unit != nullptr) {
+            ggml_backend_tensor_set(units[il], unit + (size_t) hparams.n_embd * il, 0, hparams.n_embd * sizeof(float));
+        }
+    }
+    return true;
+}
+
+void llama_adapter_cvec::steer_set_tau(const float * tau, int32_t n_layer) {
+    for (int il = 1; il < n_layer && (size_t) il < taus.size(); il++) {
+        ggml_backend_tensor_set(taus[il], tau + il, 0, sizeof(float));
+    }
+}
+
 bool llama_adapter_cvec::init(const llama_model & model) {
     const auto & hparams = model.hparams;
 
@@ -41,7 +120,7 @@ bool llama_adapter_cvec::init(const llama_model & model) {
         auto it = ctx_map.find(buft);
         if (it == ctx_map.end()) {
             ggml_init_params params = {
-                /*.mem_size   =*/ hparams.n_layer()*ggml_tensor_overhead(),
+                /*.mem_size   =*/ 3*hparams.n_layer()*ggml_tensor_overhead(),
                 /*.mem_buffer =*/ NULL,
                 /*.no_alloc   =*/ true,
             };
@@ -63,6 +142,8 @@ bool llama_adapter_cvec::init(const llama_model & model) {
     // make tensors
     tensors.reserve(hparams.n_layer());
     tensors.push_back(nullptr); // there's never a tensor for layer 0
+    units.push_back(nullptr);
+    taus.push_back(nullptr);
     for (size_t il = 1; il < hparams.n_layer(); il++) {
         ggml_backend_buffer_type_t buft = model.select_buft(il);
         ggml_context * ctx = ctx_for_buft(buft);
@@ -72,6 +153,8 @@ bool llama_adapter_cvec::init(const llama_model & model) {
         }
         ggml_tensor * tensor = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hparams.n_embd);
         tensors.push_back(tensor);
+        units.push_back(ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hparams.n_embd));
+        taus.push_back(ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1));
     }
 
     // allocate tensors / buffers and zero
